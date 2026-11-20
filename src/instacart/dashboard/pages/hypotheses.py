@@ -64,6 +64,60 @@ def _show_inference(result: dict[str, Any] | None) -> None:
     st.info(result["interpretation"])
 
 
+def _add_interval_lines(
+    figure: go.Figure,
+    rows: list[dict[str, Any]],
+    *,
+    category_key: str,
+    estimate_key: str,
+    lower_key: str,
+    upper_key: str,
+    scale: float,
+) -> int:
+    line_x: list[float | None] = []
+    line_y: list[str | None] = []
+    missing = 0
+    for row in rows:
+        lower, upper = row[lower_key], row[upper_key]
+        if lower is None or upper is None:
+            missing += 1
+            continue
+        label = str(row[category_key])
+        line_x.extend([float(lower) * scale, float(upper) * scale, None])
+        line_y.extend([label, label, None])
+    if line_x:
+        figure.add_trace(
+            go.Scatter(
+                x=line_x,
+                y=line_y,
+                mode="lines",
+                name="95% bootstrap ДИ по покупателям",
+                line={"color": PALETTE["navy"], "width": 2},
+                hoverinfo="skip",
+            )
+        )
+    figure.add_trace(
+        go.Scatter(
+            x=[
+                float(row[estimate_key]) * scale if row[estimate_key] is not None else None
+                for row in rows
+            ],
+            y=[str(row[category_key]) for row in rows],
+            mode="markers",
+            name="Точечная оценка",
+            marker={"size": 9, "color": PALETTE["teal"]},
+        )
+    )
+    return missing
+
+
+def _cluster_inference_note() -> None:
+    st.caption(
+        "Базовые p-value не учитывают зависимость наблюдений внутри покупателей. "
+        "Основные bootstrap-доверительные интервалы учитывают покупательские кластеры."
+    )
+
+
 def _heatmap(
     values: list[list[float]], title: str, *, percent: bool = False, residual: bool = False
 ) -> None:
@@ -102,6 +156,7 @@ def _h1_page(result: dict[str, Any] | None, readiness: Readiness, database_url: 
     _show_inference(result)
     if result is None:
         return
+    _cluster_inference_note()
     metrics = result["metrics"] or {}
     if not metrics.get("observed"):
         empty_state("В опубликованном результате отсутствует матрица наблюдаемых частот.")
@@ -176,6 +231,7 @@ def _h2_page(results: list[dict[str, Any]], categories: list[dict[str, Any]], le
         f"Поправка Holm между двумя уровнями категорий: {format_p_value(holm)}. "
         "Проверка и bootstrap-интервалы рассчитаны для полного набора позиций prior/train."
     )
+    _cluster_inference_note()
     entries = [
         row
         for row in categories
@@ -186,60 +242,54 @@ def _h2_page(results: list[dict[str, Any]], categories: list[dict[str, Any]], le
         return
     visible = sorted(entries, key=lambda row: row["item_count"], reverse=True)[:20]
     visible = list(reversed(visible))
-    x = [row["reorder_rate"] * 100 for row in visible]
-    lower = [
-        max(0.0, (row["reorder_rate"] - row["ci_lower"]) * 100)
-        if row["ci_lower"] is not None
-        else 0
-        for row in visible
-    ]
-    upper = [
-        max(0.0, (row["ci_upper"] - row["reorder_rate"]) * 100)
-        if row["ci_upper"] is not None
-        else 0
-        for row in visible
-    ]
-    figure = go.Figure(
-        go.Scatter(
-            x=x,
-            y=[row["category_name"] for row in visible],
-            mode="markers",
-            marker={"size": 9, "color": PALETTE["teal"]},
-            error_x={
-                "type": "data",
-                "symmetric": False,
-                "array": upper,
-                "arrayminus": lower,
-                "color": PALETTE["navy"],
-            },
-            customdata=[[row["item_count"], row["reorder_count"]] for row in visible],
-            hovertemplate=(
-                "%{y}<br>Доля повторов: %{x:.2f}%<br>Позиции: %{customdata[0]:,}"
-                "<br>Повторы: %{customdata[1]:,}<extra></extra>"
-            ),
-        )
+    figure = go.Figure()
+    missing_intervals = _add_interval_lines(
+        figure,
+        visible,
+        category_key="category_name",
+        estimate_key="reorder_rate",
+        lower_key="ci_lower",
+        upper_key="ci_upper",
+        scale=100,
+    )
+    figure.data[-1].update(
+        customdata=[[row["item_count"], row["reorder_count"]] for row in visible],
+        hovertemplate=(
+            "%{y}<br>Доля повторов: %{x:.2f}%<br>Позиции: %{customdata[0]:,}"
+            "<br>Повторы: %{customdata[1]:,}<extra></extra>"
+        ),
     )
     st.plotly_chart(
         style_figure(
             figure,
-            title="Доля повторов и 95% bootstrap ДИ · категории с наибольшим объёмом",
+            title="Доля повторов и 95% bootstrap ДИ · топ категорий",
             x_title="Повторные позиции, %",
             y_title="",
             height=min(640, max(420, len(visible) * 24)),
         ),
         use_container_width=True,
     )
+    if missing_intervals:
+        st.caption(
+            f"Для {missing_intervals} категорий без доверительного интервала "
+            "показана только оценка."
+        )
     table = [
         {
             "Категория": row["category_name"],
             "Позиции": row["item_count"],
             "Повторные позиции": row["reorder_count"],
-            "Доля повторов": format_percent(row["reorder_rate"]),
+            "Доля повторов": row["reorder_rate"],
             "95% ДИ": interval_text(row["ci_lower"], row["ci_upper"], percent=True),
         }
         for row in entries
     ]
-    st.dataframe(table, hide_index=True, use_container_width=True)
+    st.dataframe(
+        table,
+        hide_index=True,
+        column_config={"Доля повторов": st.column_config.NumberColumn(format="percent")},
+        use_container_width=True,
+    )
     st.caption(
         "Интервалы рассчитаны кластерным bootstrap по покупателям. Уникальные "
         "покупатели между категориями не суммируются."
@@ -250,6 +300,7 @@ def _h3_page(
     results: list[dict[str, Any]],
     categories: list[dict[str, Any]],
     pairs: list[dict[str, Any]],
+    position_stats: list[dict[str, Any]],
     category_level: str,
     eval_sets: tuple[str, ...],
     cart_positions: tuple[int, ...],
@@ -260,6 +311,7 @@ def _h3_page(
     _show_inference(result)
     if result is None:
         return
+    _cluster_inference_note()
     metrics = result["metrics"] or {}
     rates: Mapping[str, Any] = metrics.get("position_reorder_rates", {})
     rate_rows = [
@@ -296,37 +348,33 @@ def _h3_page(
             "к одному department."
         ),
     )
+    st.caption(
+        "Доверительные интервалы проведены по фактическим границам; если интервал "
+        "не оценён, отображается только точечная оценка."
+    )
     pair_rows = [row for row in pairs if bool(row["department_matched"]) == matched]
     if pair_rows:
-        differences = [
-            row["risk_difference"] * 100 if row["risk_difference"] is not None else None
+        pair_chart_rows = [
+            {**row, "comparison_label": row["comparison"].replace("_vs_", " − ")}
             for row in pair_rows
         ]
-        lower = [
-            max(0, (row["risk_difference"] - row["ci_lower"]) * 100)
-            if row["risk_difference"] is not None and row["ci_lower"] is not None
-            else 0
-            for row in pair_rows
-        ]
-        upper = [
-            max(0, (row["ci_upper"] - row["risk_difference"]) * 100)
-            if row["risk_difference"] is not None and row["ci_upper"] is not None
-            else 0
-            for row in pair_rows
-        ]
-        figure = go.Figure(
-            go.Scatter(
-                x=differences,
-                y=[row["comparison"].replace("_vs_", " − ") for row in pair_rows],
-                mode="markers",
-                marker={"size": 10, "color": PALETTE["coral"] if matched else PALETTE["navy"]},
-                error_x={"type": "data", "symmetric": False, "array": upper, "arrayminus": lower},
-                customdata=[[row["order_count"]] for row in pair_rows],
-                hovertemplate=(
-                    "%{y}<br>Разность долей: %{x:.2f} п.п.<br>"
-                    "Корзины: %{customdata[0]:,}<extra></extra>"
-                ),
-            )
+        figure = go.Figure()
+        missing_intervals = _add_interval_lines(
+            figure,
+            pair_chart_rows,
+            category_key="comparison_label",
+            estimate_key="risk_difference",
+            lower_key="ci_lower",
+            upper_key="ci_upper",
+            scale=100,
+        )
+        figure.data[-1].update(
+            marker={"size": 10, "color": PALETTE["coral"] if matched else PALETTE["navy"]},
+            customdata=[[row["order_count"]] for row in pair_rows],
+            hovertemplate=(
+                "%{y}<br>Разность долей: %{x:.2f} п.п.<br>"
+                "Корзины: %{customdata[0]:,}<extra></extra>"
+            ),
         )
         figure.add_vline(x=0, line_dash="dash", line_color=PALETTE["slate"])
         st.plotly_chart(
@@ -339,20 +387,73 @@ def _h3_page(
             ),
             use_container_width=True,
         )
+        if missing_intervals:
+            st.caption(
+                f"Для {missing_intervals} сравнений без доверительного интервала "
+                "показана только точечная оценка."
+            )
         table = [
             {
                 "Сравнение": row["comparison"].replace("_vs_", " − "),
                 "Корзины": row["order_count"],
-                "Первая позиция повторена": row["discordant_first_only"],
-                "Вторая позиция повторена": row["discordant_second_only"],
-                "Разность долей": format_percentage_points(row["risk_difference"]),
+                "Повторена только первая позиция": row["discordant_first_only"],
+                "Повторена только вторая позиция": row["discordant_second_only"],
+                "Разность долей, п.п.": (
+                    float(row["risk_difference"]) * 100
+                    if row["risk_difference"] is not None
+                    else None
+                ),
                 "95% bootstrap ДИ": percentage_point_interval(row["ci_lower"], row["ci_upper"]),
                 "p-value": format_p_value(row["p_value"]),
                 "p-value Holm": format_p_value(row["p_adjusted"]),
             }
             for row in pair_rows
         ]
-        st.dataframe(table, hide_index=True, use_container_width=True)
+        st.dataframe(
+            table,
+            hide_index=True,
+            column_config={"Разность долей, п.п.": st.column_config.NumberColumn(format="%.1f")},
+            use_container_width=True,
+        )
+        st.caption(
+            "Дискордантные счётчики показывают пары, где повторена только первая "
+            "или только вторая позиция."
+        )
+
+    st.markdown("**Описательная зависимость от позиции · все размеры корзин**")
+    st.caption(
+        "Отдельный срез mart.cart_position_stats для выбранных выборок. Доля на позиции "
+        "рассчитана как сумма повторов / сумма товарных позиций; эти данные не входят "
+        "в парное исследование сопоставимых корзин H3."
+    )
+    position_rows = [row for row in position_stats if int(row["item_count"]) > 0]
+    if position_rows:
+        position_rates = [row["reorder_count"] / row["item_count"] for row in position_rows]
+        position_figure = go.Figure(
+            go.Scatter(
+                x=[row["cart_position"] for row in position_rows],
+                y=[rate * 100 for rate in position_rates],
+                mode="lines+markers",
+                marker={"size": 5, "color": PALETTE["teal"]},
+                customdata=[[row["item_count"], row["reorder_count"]] for row in position_rows],
+                hovertemplate=(
+                    "Позиция %{x}<br>Доля повторов: %{y:.2f}%<br>"
+                    "Позиции: %{customdata[0]:,}<br>Повторы: %{customdata[1]:,}<extra></extra>"
+                ),
+            )
+        )
+        st.plotly_chart(
+            style_figure(
+                position_figure,
+                title="Доля повторов по позиции товара · все корзины",
+                x_title="Позиция товара в корзине",
+                y_title="Повторные позиции, %",
+                height=360,
+            ),
+            use_container_width=True,
+        )
+    else:
+        empty_state("Нет опубликованных данных по позиции товара для выбранных выборок.")
 
     st.markdown("**Описательная детализация по категориям**")
     st.caption(
@@ -431,12 +532,13 @@ def _h3_page(
                 "Выборка": row["eval_set"],
                 "Позиция": row["cart_position"],
                 "Наблюдений": row["item_count"],
-                "Доля повторов": format_percent(row["reorder_rate"]),
+                "Доля повторов": row["reorder_rate"],
                 "95% ДИ Wilson": interval_text(row["ci_lower"], row["ci_upper"], percent=True),
             }
             for row in rows
         ],
         hide_index=True,
+        column_config={"Доля повторов": st.column_config.NumberColumn(format="percent")},
         use_container_width=True,
     )
     st.caption(
@@ -529,6 +631,7 @@ def render(readiness: Readiness, database_url: str) -> None:
             results,
             data["categories"],
             data["pairs"],
+            data["position_stats"],
             level,
             tuple(eval_sets),
             tuple(positions),

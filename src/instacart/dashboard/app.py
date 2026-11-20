@@ -6,7 +6,12 @@ import psycopg
 import streamlit as st
 
 from instacart.config import Settings
-from instacart.dashboard.data import Readiness, get_readiness
+from instacart.dashboard.data import (
+    PublicationChanged,
+    Readiness,
+    assert_publication_current,
+    get_readiness,
+)
 from instacart.dashboard.pages import categories, hypotheses, overview, segmentation
 
 
@@ -21,22 +26,37 @@ def _page_context() -> tuple[Readiness, str]:
 
 def _overview_page() -> None:
     readiness, database_url = _page_context()
-    overview.render(readiness, database_url)
+    _render_consistent_page(overview.render, readiness, database_url)
 
 
 def _categories_page() -> None:
     readiness, database_url = _page_context()
-    categories.render(readiness, database_url)
+    _render_consistent_page(categories.render, readiness, database_url)
 
 
 def _hypotheses_page() -> None:
     readiness, database_url = _page_context()
-    hypotheses.render(readiness, database_url)
+    _render_consistent_page(hypotheses.render, readiness, database_url)
 
 
 def _segmentation_page() -> None:
     readiness, database_url = _page_context()
-    segmentation.render(readiness, database_url)
+    _render_consistent_page(segmentation.render, readiness, database_url)
+
+
+def _render_consistent_page(renderer, readiness: Readiness, database_url: str) -> None:
+    """Hide a page's output if its publication changed while data was being read."""
+    content = st.empty()
+    try:
+        with content.container():
+            renderer(readiness, database_url)
+        assert_publication_current(database_url, readiness)
+    except PublicationChanged:
+        content.empty()
+        raise
+    except (psycopg.Error, OSError):
+        content.empty()
+        raise
 
 
 def main() -> None:
@@ -68,10 +88,11 @@ def main() -> None:
         st.header("Состояние данных")
         if readiness.dashboard_ready:
             st.success("Опубликованная аналитика актуальна")
-            st.caption(f"Fingerprint: `{readiness.dataset_fingerprint}`")
-            st.caption(f"Импорт: `{readiness.ingestion_run_id}`")
-            st.caption(f"Витрины: `{readiness.marts_run_id}`")
-            st.caption(f"Анализ: `{readiness.analysis_run_id}`")
+            with st.expander("Технические сведения"):
+                st.caption(f"Fingerprint: `{readiness.dataset_fingerprint}`")
+                st.caption(f"Импорт: `{readiness.ingestion_run_id}`")
+                st.caption(f"Витрины: `{readiness.marts_run_id}`")
+                st.caption(f"Анализ: `{readiness.analysis_run_id}`")
         else:
             st.warning("Актуальные витрины и результаты анализа не опубликованы полностью.")
             st.caption(f"Витрины готовы: {'да' if readiness.marts_ready else 'нет'}")
@@ -100,6 +121,12 @@ def main() -> None:
     navigation = st.navigation(pages, position="sidebar")
     try:
         navigation.run()
+    except PublicationChanged:
+        st.error(
+            "Публикация изменилась во время чтения. Обновите страницу перед просмотром данных."
+        )
+        if st.button("Обновить публикацию", key="refresh_stale_dashboard"):
+            st.rerun()
     except psycopg.OperationalError:
         st.error(
             "Соединение с PostgreSQL потеряно во время чтения. "
@@ -110,4 +137,5 @@ def main() -> None:
         st.caption(f"Техническая причина: {type(exc).__name__}")
 
 
-main()
+if __name__ == "__main__":
+    main()

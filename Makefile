@@ -33,7 +33,7 @@ validate-analytics:
 	uv run instacart validate-analytics --report "$(ANALYTICS_VALIDATION_REPORT)"
 
 dashboard:
-	uv run streamlit run src/instacart/dashboard/app.py
+	uv run streamlit run src/instacart/dashboard/app.py --server.address=127.0.0.1
 
 lint:
 	uv run ruff check .

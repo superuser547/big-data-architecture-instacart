@@ -173,20 +173,14 @@ def render(readiness: Readiness, database_url: str) -> None:
     if not known or known["known_order_count"] == 0:
         empty_state("Для выбранных фильтров нет заказов с известной корзиной (prior/train).")
         return
-    cols = st.columns(4)
+    cols = st.columns(3)
     with cols[0]:
         metric_card(
             "Известные заказы", known["known_order_count"], "Заказы prior/train после фильтров."
         )
     with cols[1]:
-        metric_card(
-            "Покупатели в срезе",
-            known["buyer_count"],
-            "Уникальные покупатели внутри выбранного среза.",
-        )
-    with cols[2]:
         metric_card("Позиции", known["item_count"], "Позиции известных корзин выбранного среза.")
-    with cols[3]:
+    with cols[2]:
         metric_card(
             "Повторные позиции",
             (known["repeated_item_count"] / known["item_count"]) if known["item_count"] else None,

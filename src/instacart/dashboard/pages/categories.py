@@ -8,13 +8,7 @@ import streamlit as st
 from instacart.dashboard.charts import PALETTE, style_figure
 from instacart.dashboard.components import empty_state, eval_set_filter, page_title
 from instacart.dashboard.data import Readiness, load_category_data
-from instacart.dashboard.metrics import (
-    format_number,
-    format_percent,
-    lineage_arguments,
-    ratio,
-    resolve_parent_departments,
-)
+from instacart.dashboard.metrics import format_number, format_percent, lineage_arguments, ratio
 
 
 def _name_options(rows: list[dict], kind: str) -> dict[int, str]:
@@ -53,15 +47,7 @@ def _category_filters(data: dict) -> tuple[tuple[int, ...], tuple[int, ...]]:
             help="Список групп сужается выбранными подразделениями.",
         )
     selected_aisle_ids = tuple(int(value) for value in selected_aisles)
-    aisle_to_department = {
-        int(row["group_id"]): int(row["department_id"]) for row in allowed_aisles
-    }
-    effective_department_ids = resolve_parent_departments(
-        selected_dept_ids,
-        selected_aisle_ids,
-        aisle_to_department,
-    )
-    return effective_department_ids, selected_aisle_ids
+    return selected_dept_ids, selected_aisle_ids
 
 
 def _popularity_chart(rows: list[dict], level: str, title: str) -> None:
@@ -103,12 +89,48 @@ def _popularity_chart(rows: list[dict], level: str, title: str) -> None:
             "Категория": row["group_name"],
             "Позиции": row["item_count"],
             "Повторные позиции": row["reorder_count"],
-            "Доля повторов": format_percent(ratio(row["reorder_count"], row["item_count"])),
+            "Доля повторов": ratio(row["reorder_count"], row["item_count"]),
             "Заказы": row["order_count"],
         }
         for row in selected
     ]
-    st.dataframe(table_rows, hide_index=True, use_container_width=True)
+    st.dataframe(
+        table_rows,
+        hide_index=True,
+        column_config={"Доля повторов": st.column_config.NumberColumn(format="percent")},
+        use_container_width=True,
+    )
+
+
+def _top_products_chart(rows: list[dict]) -> None:
+    if not rows:
+        empty_state("Нет товаров для построения Top-N по выбранным выборкам и категориям.")
+        return
+    visible = list(reversed(rows))
+    figure = go.Figure(
+        go.Bar(
+            x=[int(row["item_count"]) for row in visible],
+            y=[row["product_name"] for row in visible],
+            orientation="h",
+            marker_color=PALETTE["blue"],
+            customdata=[
+                [format_percent(ratio(row["reorder_count"], row["item_count"]))] for row in visible
+            ],
+            hovertemplate=(
+                "%{y}<br>Товарные позиции: %{x:,}<br>Доля повторов: %{customdata[0]}<extra></extra>"
+            ),
+        )
+    )
+    st.plotly_chart(
+        style_figure(
+            figure,
+            title="Top-N товаров по товарным позициям",
+            x_title="Товарные позиции",
+            y_title="",
+            height=min(640, max(380, len(visible) * 26)),
+        ),
+        use_container_width=True,
+    )
 
 
 def render(readiness: Readiness, database_url: str) -> None:
@@ -129,8 +151,9 @@ def render(readiness: Readiness, database_url: str) -> None:
             key="category_level",
         )
     st.caption(
-        "Выбранная товарная группа ограничивает подразделения своим родителем. "
-        "Фильтры времени и размера корзины применяются только к mart.category_activity."
+        "Выборки, подразделения и товарные группы применяются к популярности, товарам и "
+        "структуре спроса. Время и размер корзины применяются только к структуре спроса. "
+        "Top-N меняет только график популярных товаров; поиск ограничивает только таблицу."
     )
     time_cols = st.columns([1.3, 2, 2, 1])
     with time_cols[0]:
@@ -160,6 +183,11 @@ def render(readiness: Readiness, database_url: str) -> None:
         )
     with time_cols[3]:
         top_n = st.select_slider("Top товаров", options=[10, 20, 50, 100], value=20)
+    product_search = st.text_input(
+        "Поиск товара по названию",
+        key="category_product_search",
+        help="Ищет по всей выборке товаров с применёнными выборками и фильтрами категорий.",
+    )
 
     fingerprint, ingestion_id, marts_id, analysis_id = lineage_arguments(readiness)
     base_args = (
@@ -181,6 +209,7 @@ def render(readiness: Readiness, database_url: str) -> None:
         int(basket[0]),
         int(basket[1]),
         int(top_n),
+        product_search,
     )
     department_ids, aisle_ids = _category_filters(dimension_data)
     if department_ids or aisle_ids:
@@ -194,6 +223,7 @@ def render(readiness: Readiness, database_url: str) -> None:
             int(basket[0]),
             int(basket[1]),
             int(top_n),
+            product_search,
         )
     else:
         data = dimension_data
@@ -208,104 +238,116 @@ def render(readiness: Readiness, database_url: str) -> None:
         _popularity_chart(data["popularity"], "aisle", "Топ товарных групп по товарным позициям")
     st.caption(
         "Доля повторов рассчитана как сумма повторных позиций / сумма всех позиций. "
-        "Уникальные покупатели между категориями не суммируются. Витрины популярности имеют "
-        "гранулярность выборки и категории; фильтры времени и корзины на них не действуют."
+        "Число покупателей не агрегируется между группами. При фильтре товарных групп "
+        "объёмы подразделений пересчитываются по выбранным группам; число заказов для такого "
+        "итога не показывается, поскольку заказы могут пересекаться."
     )
 
     st.subheader("Структура спроса и выбранная категория")
     rows = data["activity"]
     if not rows:
         empty_state("Нет товарных позиций для выбранных категории, времени и размера корзины.")
-        return
-    total_items = sum(int(row["item_count"]) for row in rows)
-    visible_rows = rows[:20]
-    figure = go.Figure(
-        go.Bar(
-            y=[row["category_name"] for row in visible_rows][::-1],
-            x=[row["item_count"] for row in visible_rows][::-1],
-            orientation="h",
-            marker_color=PALETTE["teal"],
-            customdata=[
-                [format_percent(ratio(row["item_count"], total_items))] for row in visible_rows
-            ][::-1],
-            hovertemplate=(
-                "%{y}<br>Позиции: %{x:,}<br>Доля среза: %{customdata[0]}<extra></extra>"
-            ),
+    else:
+        total_items = sum(int(row["item_count"]) for row in rows)
+        visible_rows = rows[:20]
+        figure = go.Figure(
+            go.Bar(
+                y=[row["category_name"] for row in visible_rows][::-1],
+                x=[row["item_count"] for row in visible_rows][::-1],
+                orientation="h",
+                marker_color=PALETTE["teal"],
+                customdata=[
+                    [format_percent(ratio(row["item_count"], total_items))] for row in visible_rows
+                ][::-1],
+                hovertemplate=(
+                    "%{y}<br>Позиции: %{x:,}<br>Доля среза: %{customdata[0]}<extra></extra>"
+                ),
+            )
         )
-    )
-    st.plotly_chart(
-        style_figure(
-            figure,
-            title=(
-                f"Структура спроса: {category_level} · топ-20"
-                if len(rows) > 20
-                else f"Структура спроса: {category_level}"
+        st.plotly_chart(
+            style_figure(
+                figure,
+                title=(
+                    f"Структура спроса: {category_level} · топ-20"
+                    if len(rows) > 20
+                    else f"Структура спроса: {category_level}"
+                ),
+                x_title="Позиции",
+                y_title="Категория",
+                height=min(640, max(390, len(visible_rows) * 24)),
             ),
-            x_title="Позиции",
-            y_title="Категория",
-            height=min(640, max(390, len(visible_rows) * 24)),
-        ),
-        use_container_width=True,
-    )
-    st.dataframe(
-        [
-            {
-                "Категория": row["category_name"],
-                "Позиции": row["item_count"],
-                "Повторные позиции": row["reorder_count"],
-                "Доля повторов": format_percent(ratio(row["reorder_count"], row["item_count"])),
-                "Доля спроса": format_percent(ratio(row["item_count"], total_items)),
-            }
-            for row in rows
-        ],
-        hide_index=True,
-        use_container_width=True,
-    )
-    category_names = {int(row["category_id"]): str(row["category_name"]) for row in rows}
-    selected_id = st.selectbox(
-        "Детализация категории",
-        options=list(category_names),
-        format_func=lambda value: category_names[value],
-        key="category_detail",
-    )
-    selected = next(row for row in rows if int(row["category_id"]) == int(selected_id))
-    cols = st.columns(4)
-    with cols[0]:
-        st.metric("Позиции", format_number(selected["item_count"]))
-    with cols[1]:
-        st.metric("Повторные позиции", format_number(selected["reorder_count"]))
-    with cols[2]:
-        st.metric(
-            "Доля повторов",
-            format_percent(ratio(selected["reorder_count"], selected["item_count"])),
+            use_container_width=True,
         )
-    with cols[3]:
-        st.metric("Доля спроса в срезе", format_percent(ratio(selected["item_count"], total_items)))
+        st.dataframe(
+            [
+                {
+                    "Категория": row["category_name"],
+                    "Позиции": row["item_count"],
+                    "Повторные позиции": row["reorder_count"],
+                    "Доля повторов": ratio(row["reorder_count"], row["item_count"]),
+                    "Доля спроса": ratio(row["item_count"], total_items),
+                }
+                for row in rows
+            ],
+            hide_index=True,
+            column_config={
+                "Доля повторов": st.column_config.NumberColumn(format="percent"),
+                "Доля спроса": st.column_config.NumberColumn(format="percent"),
+            },
+            use_container_width=True,
+        )
+        category_names = {int(row["category_id"]): str(row["category_name"]) for row in rows}
+        selected_id = st.selectbox(
+            "Детализация категории",
+            options=list(category_names),
+            format_func=lambda value: category_names[value],
+            key="category_detail",
+        )
+        selected = next(row for row in rows if int(row["category_id"]) == int(selected_id))
+        cols = st.columns(4)
+        with cols[0]:
+            st.metric("Позиции", format_number(selected["item_count"]))
+        with cols[1]:
+            st.metric("Повторные позиции", format_number(selected["reorder_count"]))
+        with cols[2]:
+            st.metric(
+                "Доля повторов",
+                format_percent(ratio(selected["reorder_count"], selected["item_count"])),
+            )
+        with cols[3]:
+            st.metric(
+                "Доля спроса в срезе", format_percent(ratio(selected["item_count"], total_items))
+            )
     st.caption(
         "Категорийный срез использует mart.category_activity: eval_set, код дня, час и размер "
         "известной корзины применены совместно. Количество покупателей здесь не суммируется."
     )
 
     st.subheader("Популярные товары")
+    _top_products_chart(data["top_products"])
     products = data["products"]
     if not products:
-        empty_state(
-            "Нет товаров для выбранных выборок и категорий; например, у test состав неизвестен."
+        empty_state("Нет совпадений в поиске или товары недоступны для выбранных выборок.")
+    else:
+        product_table = [
+            {
+                "Товар": row["product_name"],
+                "Позиции": row["item_count"],
+                "Повторные позиции": row["reorder_count"],
+                "Доля повторов": row["reorder_rate"],
+                "Заказы": row["order_count"],
+                "Товарная группа": row["aisle_name"],
+                "Подразделение": row["department_name"],
+            }
+            for row in products
+        ]
+        st.dataframe(
+            product_table,
+            hide_index=True,
+            column_config={"Доля повторов": st.column_config.NumberColumn(format="percent")},
+            use_container_width=True,
         )
-        return
-    product_table = [
-        {
-            "Товар": row["product_name"],
-            "Позиции": row["item_count"],
-            "Повторные позиции": row["reorder_count"],
-            "Доля повторов": format_percent(ratio(row["reorder_count"], row["item_count"])),
-            "Заказы": row["order_count"],
-            "Товарная группа": row["aisle_name"],
-            "Подразделение": row["department_name"],
-        }
-        for row in products
-    ]
-    st.dataframe(product_table, hide_index=True, use_container_width=True)
     st.caption(
-        f"Показаны первые {len(products)} товаров по количеству позиций из mart.product_popularity."
+        "Поиск выполняется по всей подходящей выборке, затем выводятся первые 500 совпадений "
+        "по количеству позиций. График Top-N использует отдельный рейтинг."
     )

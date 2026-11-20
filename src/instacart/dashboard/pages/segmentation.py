@@ -105,15 +105,17 @@ def render(readiness: Readiness, database_url: str) -> None:
         f"{_selection_rationale(data['selection_basis'])}"
     )
 
-    size_columns = st.columns(min(4, len(profiles)))
-    for column, profile in zip(size_columns, profiles, strict=False):
-        cluster_id = int(profile["cluster_id"])
-        share = profile["customer_count"] / cluster_count if cluster_count else None
-        with column:
-            st.metric(
-                f"Кластер {cluster_id} · {format_percent(share)}",
-                format_number(profile["customer_count"]),
-            )
+    for start in range(0, len(profiles), 4):
+        batch = profiles[start : start + 4]
+        size_columns = st.columns(len(batch))
+        for column, profile in zip(size_columns, batch, strict=True):
+            cluster_id = int(profile["cluster_id"])
+            share = profile["customer_count"] / cluster_count if cluster_count else None
+            with column:
+                st.metric(
+                    f"Кластер {cluster_id} · {format_percent(share)}",
+                    format_number(profile["customer_count"]),
+                )
 
     st.subheader("Профили сегментов")
     st.caption(
@@ -259,11 +261,16 @@ def render(readiness: Readiness, database_url: str) -> None:
         row: dict[str, Any] = {
             "Сегмент": int(profile["cluster_id"]),
             "Покупатели": int(profile["customer_count"]),
-            "Доля покупателей": format_percent(
+            "Доля покупателей": (
                 profile["customer_count"] / cluster_count if cluster_count else None
             ),
         }
         for feature, (label, unit) in FEATURE_LABELS.items():
             row[f"{label}, {unit}"] = _display_feature_value(feature, means.get(feature))
         table_rows.append(row)
-    st.dataframe(table_rows, hide_index=True, use_container_width=True)
+    st.dataframe(
+        table_rows,
+        hide_index=True,
+        column_config={"Доля покупателей": st.column_config.NumberColumn(format="percent")},
+        use_container_width=True,
+    )

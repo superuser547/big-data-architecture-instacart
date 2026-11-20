@@ -12,6 +12,15 @@ from alembic.config import Config
 import instacart.analytics.service as analytics_service
 from instacart.analytics.service import analyze, build_marts, validate_analytics
 from instacart.config import Settings
+from instacart.dashboard.data import (
+    get_readiness,
+    load_category_data,
+    load_h1_slice,
+    load_hypotheses,
+    load_overview,
+    load_segments,
+)
+from instacart.dashboard.metrics import lineage_arguments
 
 
 def _seed_core(dsn: str) -> str:
@@ -311,6 +320,79 @@ def test_marts_analysis_idempotency_rollback_and_staleness(monkeypatch: pytest.M
         assert readiness == (True, False, False)
     analyze(settings, random_seed=2026, bootstrap_replicates=10, silhouette_sample_size=12)
     assert validate_analytics(settings)["dashboard_ready"] is True
+
+    readiness = get_readiness(dsn)
+    lineage = lineage_arguments(readiness)
+    overview = load_overview(
+        dsn,
+        *lineage,
+        ("prior", "train", "test"),
+        tuple(range(7)),
+        tuple(range(24)),
+        1,
+        200,
+    )
+    assert overview["overview"]["order_count"] == 36
+    assert overview["known_summary"]["known_order_count"] == 35
+    h1_slice = load_h1_slice(
+        dsn,
+        *lineage,
+        ("prior", "train"),
+        tuple(range(7)),
+        tuple(range(24)),
+    )
+    assert h1_slice
+    category_data = load_category_data(
+        dsn,
+        *lineage,
+        ("prior", "train"),
+        (2,),
+        (3,),
+        "department",
+        tuple(range(7)),
+        tuple(range(24)),
+        1,
+        200,
+        1,
+        "Product 2",
+        20,
+    )
+    assert len(category_data["top_products"]) == 1
+    assert len(category_data["products"]) > len(category_data["top_products"])
+    assert all("Product 2" in row["product_name"] for row in category_data["products"])
+    department_rollup = next(
+        row
+        for row in category_data["popularity"]
+        if row["group_type"] == "department" and row["department_id"] == 2
+    )
+    assert department_rollup["order_count"] is None
+    expected_aisle_items = sum(
+        int(row["item_count"])
+        for row in category_data["popularity"]
+        if row["group_type"] == "aisle" and row["group_id"] == 3
+    )
+    assert department_rollup["item_count"] == expected_aisle_items
+    assert category_data["activity"]
+    hypotheses = load_hypotheses(
+        dsn,
+        *lineage,
+        "department",
+        ("prior", "train"),
+        (1, 10, 20),
+        None,
+    )
+    assert {row["hypothesis_id"] for row in hypotheses["results"]} == {
+        "H1",
+        "H2_department",
+        "H2_aisle",
+        "H3",
+    }
+    assert hypotheses["position_stats"]
+    segments = load_segments(dsn, *lineage, sample_limit=12)
+    assert segments["displayed_sample_size"] <= segments["sample_limit"]
+    assert {row["cluster_id"] for row in segments["points"]} == {
+        row["cluster_id"] for row in segments["profiles"]
+    }
 
     # Import identity participates in lineage even when the content fingerprint is equal.
     with psycopg.connect(dsn) as connection:

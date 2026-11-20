@@ -42,7 +42,10 @@ def _page_fixture(page: str) -> tuple[str, str]:
             ],
             'products': [{'product_id': 12, 'product_name': 'Apples', 'aisle_id': 3,
                 'aisle_name': 'Fresh Fruits', 'department_id': 1, 'department_name': 'Produce',
-                'item_count': 5, 'reorder_count': 2, 'order_count': 3}],
+                'item_count': 5, 'reorder_count': 2, 'reorder_rate': 0.4, 'order_count': 3}],
+            'top_products': [{'product_id': 12, 'product_name': 'Apples', 'aisle_id': 3,
+                'aisle_name': 'Fresh Fruits', 'department_id': 1, 'department_name': 'Produce',
+                'item_count': 5, 'reorder_count': 2, 'reorder_rate': 0.4, 'order_count': 3}],
             'activity': [{'category_id': 1, 'category_name': 'Produce',
                 'item_count': 5, 'reorder_count': 2}],
         }"""
@@ -99,6 +102,10 @@ def _page_fixture(page: str) -> tuple[str, str]:
                  'ci_upper': 0.1, 'p_value': 0.8, 'p_adjusted': 1.0}
                 for matched in (False, True)
             ],
+            'position_stats': [
+                {'cart_position': 1, 'item_count': 4, 'reorder_count': 2},
+                {'cart_position': 10, 'item_count': 2, 'reorder_count': 1},
+            ],
         }"""
         setup = (
             "hypotheses.load_hypotheses = lambda *args, **kwargs: fixture\n"
@@ -109,28 +116,30 @@ def _page_fixture(page: str) -> tuple[str, str]:
     else:
         fixture = """{
             'profiles': [
-                {'cluster_id': 0, 'customer_count': 4, 'feature_means': {'mean': {
-                    'prior_order_count': 2.0, 'avg_basket_size': 3.0, 'reorder_rate': 0.2,
-                    'avg_days_between_orders': 8.0, 'unique_product_count': 4.0,
-                    'unique_aisle_count': 2.0, 'unique_department_count': 1.0}}},
-                {'cluster_id': 1, 'customer_count': 4, 'feature_means': {'mean': {
-                    'prior_order_count': 4.0, 'avg_basket_size': 5.0, 'reorder_rate': 0.5,
-                    'avg_days_between_orders': 5.0, 'unique_product_count': 8.0,
-                    'unique_aisle_count': 4.0, 'unique_department_count': 2.0}}},
+                {'cluster_id': cluster, 'customer_count': 4, 'feature_means': {'mean': {
+                    'prior_order_count': 2.0 + cluster, 'avg_basket_size': 3.0 + cluster,
+                    'reorder_rate': 0.2 + cluster / 10, 'avg_days_between_orders': 8.0 - cluster,
+                    'unique_product_count': 4.0 + cluster, 'unique_aisle_count': 2.0 + cluster,
+                    'unique_department_count': 1.0 + cluster}}}
+                for cluster in range(5)
             ],
             'metrics': [
                 {'k': 2, 'inertia': 10.0, 'silhouette': 0.4,
-                 'silhouette_sample_size': 8, 'selected': True},
+                 'silhouette_sample_size': 20, 'selected': False},
                 {'k': 3, 'inertia': 7.0, 'silhouette': 0.3,
-                 'silhouette_sample_size': 8, 'selected': False},
+                 'silhouette_sample_size': 20, 'selected': False},
+                {'k': 4, 'inertia': 5.0, 'silhouette': 0.2,
+                 'silhouette_sample_size': 20, 'selected': False},
+                {'k': 5, 'inertia': 3.0, 'silhouette': 0.5,
+                 'silhouette_sample_size': 20, 'selected': True},
             ],
             'points': [
-                {'cluster_id': 0, 'pca_1': 0.1, 'pca_2': 0.2},
-                {'cluster_id': 1, 'pca_1': 0.8, 'pca_2': 0.9},
+                {'cluster_id': cluster, 'pca_1': cluster / 10, 'pca_2': cluster / 5}
+                for cluster in range(5)
             ],
-            'population_size': 8, 'selected_k': 2, 'selection_basis': 'maximum silhouette',
-            'pca_explained_variance_ratio': [0.4, 0.2], 'displayed_sample_size': 2,
-            'sample_limit': 12000,
+            'population_size': 20, 'selected_k': 5, 'selection_basis': 'maximum silhouette',
+            'pca_explained_variance_ratio': [0.4, 0.2], 'displayed_sample_size': 5,
+            'sample_limit': 5,
         }"""
         setup = "segmentation.load_segments = lambda *args, **kwargs: fixture"
         render = "segmentation.render(readiness, 'postgresql://fixture')"
@@ -161,3 +170,93 @@ def test_dashboard_pages_smoke_render_with_fixture_data(tmp_path: Path, page: st
     app = AppTest.from_file(str(app_path), default_timeout=20).run()
 
     assert len(app.exception) == 0
+    if page == "segmentation":
+        cluster_cards = [metric for metric in app.metric if metric.label.startswith("Кластер")]
+        assert len(cluster_cards) == 5
+        profile_frame = next(
+            frame.value for frame in app.dataframe if "Доля покупателей" in frame.value.columns
+        )
+        assert profile_frame["Доля покупателей"].dtype.kind == "f"
+    if page == "hypotheses":
+        paired_frame = next(
+            frame.value for frame in app.dataframe if "Разность долей, п.п." in frame.value.columns
+        )
+        assert paired_frame["Разность долей, п.п."].dtype.kind == "f"
+
+
+def test_category_filters_reach_the_data_loader(tmp_path: Path) -> None:
+    script, _ = _page_fixture("categories")
+    script = script.replace(
+        "from instacart.dashboard.data import Readiness\n",
+        "from instacart.dashboard.data import Readiness\nimport streamlit as st\n",
+    )
+    script = script.replace(
+        "categories.load_category_data = lambda *args, **kwargs: fixture",
+        "categories.load_category_data = lambda *args, **kwargs: "
+        "(st.session_state.setdefault('loader_args', []).append(args) or fixture)",
+    )
+    app_path = tmp_path / "categories_filters.py"
+    app_path.write_text(script, encoding="utf-8")
+    app = AppTest.from_file(str(app_path), default_timeout=20).run()
+    assert len(app.exception) == 0
+
+    app.multiselect(key="category_departments").set_value([1])
+    app.multiselect(key="category_aisles").set_value([3])
+    app.text_input(key="category_product_search").set_value("Apple")
+    app.run()
+
+    assert len(app.exception) == 0
+    last_call = app.session_state["loader_args"][-1]
+    assert last_call[6] == (1,)
+    assert last_call[7] == (3,)
+    assert last_call[14] == "Apple"
+
+
+def test_empty_category_activity_does_not_hide_search_results_and_rates_stay_numeric(
+    tmp_path: Path,
+) -> None:
+    script, _ = _page_fixture("categories")
+    script = script.replace(
+        "'activity': [{'category_id': 1, 'category_name': 'Produce',\n"
+        "                'item_count': 5, 'reorder_count': 2}],",
+        "'activity': [],",
+    )
+    app_path = tmp_path / "categories_empty_activity.py"
+    app_path.write_text(script, encoding="utf-8")
+    app = AppTest.from_file(str(app_path), default_timeout=20).run()
+
+    assert len(app.exception) == 0
+    product_frame = next(frame.value for frame in app.dataframe if "Товар" in frame.value.columns)
+    assert product_frame.iloc[0]["Товар"] == "Apples"
+    assert product_frame["Доля повторов"].dtype.kind == "f"
+    assert any("Нет товарных позиций" in item.value for item in app.info)
+
+
+def test_stale_publication_clears_rendered_page_content(tmp_path: Path) -> None:
+    script = """\
+import streamlit as st
+import instacart.dashboard.app as dashboard_app
+from instacart.dashboard.data import PublicationChanged, Readiness
+
+readiness = Readiness(True, True, True, 'sha256:old', 'ingestion-1', 'marts-1', 'analysis-1')
+
+def reject_changed_publication(_database_url, _readiness):
+    raise PublicationChanged('Публикация изменилась')
+
+dashboard_app.assert_publication_current = reject_changed_publication
+
+def render_stale_page(_readiness, _database_url):
+    st.markdown('Устаревшие показатели')
+
+try:
+    dashboard_app._render_consistent_page(render_stale_page, readiness, 'postgresql://fixture')
+except PublicationChanged:
+    st.error('Публикация изменилась')
+"""
+    app_path = tmp_path / "stale_publication.py"
+    app_path.write_text(script, encoding="utf-8")
+    app = AppTest.from_file(str(app_path), default_timeout=20).run()
+
+    assert len(app.exception) == 0
+    assert not any("Устаревшие показатели" in item.value for item in app.markdown)
+    assert any("Публикация изменилась" in item.value for item in app.error)
