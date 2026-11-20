@@ -30,6 +30,7 @@ def test_migration_import_idempotency_and_transactional_rollback(
             "TRUNCATE core.order_items, core.orders, core.users, core.products, core.aisles, "
             "core.departments"
         )
+        connection.execute("DELETE FROM ops.active_dataset")
         connection.execute("DELETE FROM ops.ingestion_runs")
 
     first_dataset = create_dataset(tmp_path / "first")
@@ -101,6 +102,12 @@ def test_migration_import_idempotency_and_transactional_rollback(
         )
         assert (
             connection.execute(
+                "SELECT dataset_fingerprint FROM ops.active_dataset WHERE singleton"
+            ).fetchone()[0]
+            == first["dataset_fingerprint"]
+        )
+        assert (
+            connection.execute(
                 "SELECT count(*) FROM ops.ingestion_runs WHERE status = 'failed' "
                 "AND error_message LIKE '%injected rebuild failure%'"
             ).fetchone()[0]
@@ -123,3 +130,31 @@ def test_migration_import_idempotency_and_transactional_rollback(
             == "Peas, frozen"
         )
         assert connection.execute("SELECT count(*) FROM core.order_items").fetchone()[0] == 5
+        assert (
+            connection.execute(
+                "SELECT dataset_fingerprint FROM ops.active_dataset WHERE singleton"
+            ).fetchone()[0]
+            == rebuilt["dataset_fingerprint"]
+        )
+
+    # A was imported before B, so history alone must not make this request a no-op.
+    restored = ingestion.ingest(first_dataset, settings, report_path=tmp_path / "restored.json")
+    assert restored["idempotent_skip"] is False
+    with psycopg.connect(dsn) as connection:
+        assert (
+            connection.execute(
+                "SELECT product_name FROM core.products WHERE product_id = 10"
+            ).fetchone()[0]
+            == "Frozen peas"
+        )
+        assert connection.execute("SELECT count(*) FROM core.order_items").fetchone()[0] == 5
+        assert (
+            connection.execute(
+                "SELECT dataset_fingerprint FROM ops.active_dataset WHERE singleton"
+            ).fetchone()[0]
+            == first["dataset_fingerprint"]
+        )
+    restored_again = ingestion.ingest(
+        first_dataset, settings, report_path=tmp_path / "restored-again.json"
+    )
+    assert restored_again["idempotent_skip"] is True

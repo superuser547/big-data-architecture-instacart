@@ -238,6 +238,18 @@ def _set_status(
     )
 
 
+def _set_active_dataset(
+    connection: psycopg.Connection, run_id: uuid.UUID, fingerprint: str
+) -> None:
+    connection.execute(
+        "INSERT INTO ops.active_dataset (singleton, dataset_fingerprint, run_id) "
+        "VALUES (TRUE, %s, %s) ON CONFLICT (singleton) DO UPDATE SET "
+        "dataset_fingerprint = EXCLUDED.dataset_fingerprint, run_id = EXCLUDED.run_id, "
+        "activated_at = clock_timestamp()",
+        (fingerprint, run_id),
+    )
+
+
 def ingest(
     dataset_path: Path,
     settings: Settings,
@@ -265,11 +277,10 @@ def ingest(
                 "error_message = 'Предыдущий процесс завершился до фиксации результата' "
                 "WHERE status = 'running'"
             )
-            previous = lock_connection.execute(
-                "SELECT run_id, row_counts, validation_results FROM ops.ingestion_runs "
-                "WHERE dataset_fingerprint = %s AND status = 'succeeded' "
-                "ORDER BY finished_at DESC LIMIT 1",
-                (dataset.fingerprint,),
+            active = lock_connection.execute(
+                "SELECT a.run_id, a.dataset_fingerprint, r.row_counts, r.validation_results "
+                "FROM ops.active_dataset a JOIN ops.ingestion_runs r ON r.run_id = a.run_id "
+                "WHERE a.singleton = TRUE AND r.status = 'succeeded'"
             ).fetchone()
             _register_run(lock_connection, run_id, dataset.fingerprint)
             logger.info("Проверка исходных CSV: %s", dataset.fingerprint)
@@ -281,13 +292,13 @@ def ingest(
                 ]
                 raise ValueError(f"Нарушены контракты исходных данных: {', '.join(failed)}")
 
-            if previous and not force:
-                row_counts = previous[1]
-                old_validation = previous[2]
+            if active and active[1] == dataset.fingerprint and not force:
+                row_counts = active[2]
+                old_validation = active[3]
                 skipped = {
                     "skipped": True,
-                    "reason": "этот fingerprint уже успешно загружен",
-                    "previous_run_id": str(previous[0]),
+                    "reason": "этот fingerprint уже активен в core",
+                    "active_run_id": str(active[0]),
                     "invariants": profile["invariants"],
                     "reference_counts": profile["reference_counts"],
                 }
@@ -382,6 +393,7 @@ def ingest(
                             row_counts,
                             database_report,
                         )
+                        _set_active_dataset(connection, run_id, dataset.fingerprint)
                 report.update(
                     {
                         "status": "succeeded",

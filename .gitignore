@@ -1,4 +1,7 @@
 .venv/
+.DS_Store
+._*
+Thumbs.db
 .env
 .env.*
 !.env.example

@@ -1,7 +1,7 @@
 .PHONY: setup profile ingest validate lint test check db-up db-down migrate
 
 setup:
-	uv sync --python 3.11 --all-groups
+	uv sync --locked --python 3.11 --all-groups
 	docker compose up -d --wait postgres
 	$(MAKE) migrate
 
