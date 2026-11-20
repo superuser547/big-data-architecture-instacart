@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 import numpy as np
 import psycopg
 from psycopg.types.json import Jsonb
+from scipy.sparse import csr_matrix
 
 from instacart.analytics.statistics import (
     chi_square_summary,
     holm_adjust,
     log10_p_value,
+    mcnemar_from_counts,
     percentile_interval,
     wilson_interval,
 )
@@ -21,12 +23,17 @@ from instacart.analytics.statistics import (
 ALPHA = 0.05
 
 
-def _bootstrap_weights(customer_count: int, replicates: int, random_seed: int) -> list[np.ndarray]:
+def _bootstrap_weights(
+    customer_count: int, replicates: int, random_seed: int
+) -> Iterator[np.ndarray]:
+    """Yield one full-population customer bootstrap weight vector at a time."""
+    if customer_count <= 0:
+        return
     rng = np.random.default_rng(random_seed)
-    return [
-        np.bincount(rng.integers(0, customer_count, size=customer_count), minlength=customer_count)
-        for _ in range(replicates)
-    ]
+    for _ in range(replicates):
+        yield np.bincount(
+            rng.integers(0, customer_count, size=customer_count), minlength=customer_count
+        )
 
 
 def _cramers_v(table: np.ndarray) -> float | None:
@@ -34,7 +41,7 @@ def _cramers_v(table: np.ndarray) -> float | None:
 
 
 def _bootstrap_contingency(
-    customer_matrix: np.ndarray,
+    customer_matrix: csr_matrix,
     row_count: int,
     column_count: int,
     *,
@@ -43,16 +50,14 @@ def _bootstrap_contingency(
 ) -> dict[str, Any]:
     if customer_matrix.shape[0] == 0:
         return {"sampled_customers": 0, "replicates": 0, "cramers_v_ci": None}
-    weights = _bootstrap_weights(customer_matrix.shape[0], replicates, random_seed)
     effects: list[float] = []
-    significant = 0
     category_rates = [[] for _ in range(row_count)] if column_count == 2 else None
-    for sample_weights in weights:
-        table = (sample_weights @ customer_matrix).reshape(row_count, column_count)
+    for sample_weights in _bootstrap_weights(customer_matrix.shape[0], replicates, random_seed):
+        weighted_cells = np.asarray(customer_matrix.T @ sample_weights).reshape(-1)
+        table = weighted_cells.reshape(row_count, column_count)
         summary = chi_square_summary(table)
         if summary["cramers_v"] is not None:
             effects.append(summary["cramers_v"])
-            significant += int(summary["p_value"] is not None and summary["p_value"] < ALPHA)
         if category_rates is not None:
             totals = table.sum(axis=1)
             for row_index, total in enumerate(totals):
@@ -62,13 +67,61 @@ def _bootstrap_contingency(
         "sampled_customers": int(customer_matrix.shape[0]),
         "replicates": replicates,
         "cramers_v_ci": percentile_interval(effects),
-        "significant_replicate_share": significant / len(effects) if effects else None,
-        "sampling_unit": "customer",
+        "sampling_unit": "all customers; resampled with replacement",
         "random_seed": random_seed,
     }
     if category_rates is not None:
         result["category_rate_ci"] = [percentile_interval(values) for values in category_rates]
     return result
+
+
+def _customer_csr_from_query(
+    connection: psycopg.Connection,
+    query: str,
+    parameters: tuple[Any, ...],
+    customer_count: int,
+    column_count: int,
+    transform_batch,
+) -> csr_matrix:
+    """Stream sorted customer-cell aggregates into CSR without retaining SQL rows."""
+    indptr = np.zeros(customer_count + 1, dtype=np.int64)
+    data_chunks: list[np.ndarray] = []
+    index_chunks: list[np.ndarray] = []
+    nonzero_count = 0
+    current_row: int | None = None
+    with connection.cursor(name=f"analytics_bootstrap_{uuid.uuid4().hex}") as cursor:
+        cursor.execute(query, parameters)
+        while batch := cursor.fetchmany(50_000):
+            rows, columns, values = transform_batch(np.asarray(batch, dtype=np.int64))
+            nonzero = values != 0
+            rows = rows[nonzero]
+            columns = columns[nonzero]
+            values = values[nonzero]
+            if not len(rows):
+                continue
+            data_chunks.append(values)
+            index_chunks.append(columns)
+            starts = np.r_[0, np.flatnonzero(rows[1:] != rows[:-1]) + 1]
+            ends = np.r_[starts[1:], len(rows)]
+            for start, end in zip(starts, ends, strict=True):
+                row_index = int(rows[start])
+                if row_index < 0 or row_index >= customer_count:
+                    raise ValueError("customer index is outside the bootstrap population")
+                if current_row is None:
+                    indptr[: row_index + 1] = 0
+                elif row_index != current_row:
+                    if row_index < current_row:
+                        raise ValueError("bootstrap query must be ordered by customer and cell")
+                    indptr[current_row + 1 : row_index + 1] = nonzero_count
+                if row_index != current_row:
+                    indptr[row_index] = nonzero_count
+                    current_row = row_index
+                nonzero_count += int(end - start)
+    if current_row is not None:
+        indptr[current_row + 1 :] = nonzero_count
+    data = np.concatenate(data_chunks) if data_chunks else np.empty(0, dtype=np.int64)
+    indices = np.concatenate(index_chunks) if index_chunks else np.empty(0, dtype=np.int32)
+    return csr_matrix((data, indices, indptr), shape=(customer_count, column_count), copy=False)
 
 
 def _put_result(
@@ -131,16 +184,11 @@ def _interpret(p_value: float | None, effect_name: str, effect_value: float | No
     )
 
 
-def _create_customer_sample(
-    connection: psycopg.Connection,
-    random_seed: int,
-    sample_size: int,
-) -> int:
+def _create_customer_population(connection: psycopg.Connection) -> int:
     connection.execute(
         "CREATE TEMP TABLE tmp_analytics_users ON COMMIT DROP AS "
-        "SELECT user_id FROM core.users "
-        "ORDER BY hashtextextended(user_id::TEXT, %s) LIMIT %s",
-        (random_seed, sample_size),
+        "SELECT user_id, (row_number() OVER (ORDER BY user_id) - 1)::INTEGER AS customer_index "
+        "FROM core.users"
     )
     connection.execute("CREATE UNIQUE INDEX ON tmp_analytics_users (user_id)")
     connection.execute("ANALYZE tmp_analytics_users")
@@ -154,19 +202,20 @@ def run_hypotheses(
     *,
     random_seed: int = 2026,
     bootstrap_replicates: int = 200,
-    bootstrap_customer_sample: int = 10_000,
 ) -> dict[str, Any]:
-    """Calculate full-data tests and customer-cluster bootstrap stability checks."""
+    """Calculate full-data tests and all-customer cluster-bootstrap intervals."""
+    if bootstrap_replicates < 1:
+        raise ValueError("bootstrap_replicates must be positive")
     for table in ("_hypothesis_results", "_hypothesis_categories", "_hypothesis_pairs"):
         connection.execute(f"DELETE FROM mart.{table}")
-    sample_count = _create_customer_sample(connection, random_seed, bootstrap_customer_sample)
-    h1 = _h1(connection, run_id, fingerprint, sample_count, bootstrap_replicates, random_seed)
-    h2 = _h2(connection, run_id, fingerprint, sample_count, bootstrap_replicates, random_seed)
+    customer_count = _create_customer_population(connection)
+    h1 = _h1(connection, run_id, fingerprint, customer_count, bootstrap_replicates, random_seed)
+    h2 = _h2(connection, run_id, fingerprint, customer_count, bootstrap_replicates, random_seed)
     h3 = _h3(
         connection,
         run_id,
         fingerprint,
-        sample_count,
+        customer_count,
         bootstrap_replicates,
         random_seed,
     )
@@ -175,8 +224,9 @@ def run_hypotheses(
         "customer_bootstrap": {
             "random_seed": random_seed,
             "replicates": bootstrap_replicates,
-            "sampled_customers": sample_count,
-            "customer_sample_method": "lowest hashtextextended(user_id, random_seed)",
+            "sampled_customers": customer_count,
+            "population": "all core.users",
+            "method": "resample customers with replacement; one replicate streamed at a time",
         },
         "H1": h1,
         "H2": h2,
@@ -188,7 +238,7 @@ def _h1(
     connection: psycopg.Connection,
     run_id: uuid.UUID,
     fingerprint: str,
-    sample_count: int,
+    customer_count: int,
     replicates: int,
     random_seed: int,
 ) -> dict[str, Any]:
@@ -200,19 +250,21 @@ def _h1(
         counts[int(dow), int(hour)] = int(count)
     summary = chi_square_summary(counts)
 
-    customer_ids = [
-        int(row[0])
-        for row in connection.execute("SELECT user_id FROM tmp_analytics_users ORDER BY user_id")
-    ]
-    position = {user_id: index for index, user_id in enumerate(customer_ids)}
-    per_customer = np.zeros((sample_count, 7 * 24), dtype=np.int64)
-    if customer_ids:
-        for user_id, dow, hour, count in connection.execute(
-            "SELECT s.user_id, o.order_dow, o.order_hour_of_day, count(*) "
-            "FROM tmp_analytics_users s JOIN core.orders o USING (user_id) "
-            "GROUP BY s.user_id, o.order_dow, o.order_hour_of_day"
-        ).fetchall():
-            per_customer[position[int(user_id)], int(dow) * 24 + int(hour)] = int(count)
+    per_customer = _customer_csr_from_query(
+        connection,
+        "SELECT s.customer_index, o.order_dow, o.order_hour_of_day, count(*)::BIGINT "
+        "FROM tmp_analytics_users s JOIN core.orders o USING (user_id) "
+        "GROUP BY s.customer_index, o.order_dow, o.order_hour_of_day "
+        "ORDER BY s.customer_index, o.order_dow, o.order_hour_of_day",
+        (),
+        customer_count,
+        7 * 24,
+        lambda batch: (
+            batch[:, 0].astype(np.int32),
+            (batch[:, 1] * 24 + batch[:, 2]).astype(np.int32),
+            batch[:, 3],
+        ),
+    )
     bootstrap = _bootstrap_contingency(
         per_customer,
         7,
@@ -222,6 +274,8 @@ def _h1(
     )
     metrics = {
         **summary,
+        "p_value_method": "Pearson chi-square on all orders; assumes independent orders",
+        "effect_estimator": "Bergsma bias-corrected Cramér's V",
         "day_labels": [f"order_dow={day}" for day in range(7)],
         "hour_labels": list(range(24)),
         "bootstrap": bootstrap,
@@ -233,15 +287,20 @@ def _h1(
         hypothesis_id="H1",
         h0="Распределение заказов по часам одинаково для всех значений order_dow.",
         h1="Распределение заказов по часам зависит от order_dow.",
-        method="Критерий Пирсона χ² независимости на таблице 7×24; bootstrap по покупателям.",
+        method=(
+            "Критерий Пирсона χ² на всех заказах; эффект — V с конечновыборочной поправкой, "
+            "интервал — кластерный bootstrap по всем покупателям."
+        ),
         observations=summary["observations"],
         statistic=summary["statistic"],
         p_value=summary["p_value"],
-        effect_name="Cramér’s V",
+        effect_name="Bias-corrected Cramér’s V",
         effect_value=summary["cramers_v"],
         ci=bootstrap["cramers_v_ci"],
         metrics=metrics,
-        interpretation=_interpret(summary["p_value"], "Cramér’s V", summary["cramers_v"]),
+        interpretation=_interpret(
+            summary["p_value"], "bias-corrected Cramér’s V", summary["cramers_v"]
+        ),
     )
     return metrics
 
@@ -250,22 +309,25 @@ def _category_customer_matrix(
     connection: psycopg.Connection,
     level: str,
     category_ids: Sequence[int],
-    sample_count: int,
-) -> np.ndarray:
-    index = {category_id: position for position, category_id in enumerate(category_ids)}
-    result = np.zeros((sample_count, len(category_ids) * 2), dtype=np.int64)
-    users = [
-        int(row[0])
-        for row in connection.execute("SELECT user_id FROM tmp_analytics_users ORDER BY user_id")
-    ]
-    user_index = {user_id: position for position, user_id in enumerate(users)}
+    customer_count: int,
+) -> csr_matrix:
     if level == "department":
         category_sql = "d.department_id"
     else:
         category_sql = "a.aisle_id"
-    rows = connection.execute(
+    categories = np.asarray(category_ids, dtype=np.int64)
+
+    def expand(batch: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        customer_indices = np.repeat(batch[:, 0].astype(np.int32), 2)
+        category_indices = np.searchsorted(categories, batch[:, 1]).astype(np.int32)
+        columns = np.column_stack((category_indices * 2, category_indices * 2 + 1)).reshape(-1)
+        values = np.column_stack((batch[:, 2] - batch[:, 3], batch[:, 3])).reshape(-1)
+        return customer_indices, columns, values
+
+    return _customer_csr_from_query(
+        connection,
         f"""
-        SELECT s.user_id, {category_sql} AS category_id,
+        SELECT s.customer_index, {category_sql} AS category_id,
                count(*)::BIGINT AS item_count,
                sum(i.reordered::INTEGER)::BIGINT AS repeat_count
         FROM tmp_analytics_users s
@@ -274,22 +336,21 @@ def _category_customer_matrix(
         JOIN core.products p USING (product_id)
         JOIN core.aisles a USING (aisle_id)
         JOIN core.departments d USING (department_id)
-        GROUP BY s.user_id, {category_sql}
-        """
-    ).fetchall()
-    for user_id, category_id, item_count, repeat_count in rows:
-        u = user_index[int(user_id)]
-        c = index[int(category_id)]
-        result[u, c * 2] = int(item_count - repeat_count)
-        result[u, c * 2 + 1] = int(repeat_count)
-    return result
+        GROUP BY s.customer_index, {category_sql}
+        ORDER BY s.customer_index, category_id
+        """,
+        (),
+        customer_count,
+        len(category_ids) * 2,
+        expand,
+    )
 
 
 def _h2(
     connection: psycopg.Connection,
     run_id: uuid.UUID,
     fingerprint: str,
-    sample_count: int,
+    customer_count: int,
     replicates: int,
     random_seed: int,
 ) -> dict[str, Any]:
@@ -310,7 +371,6 @@ def _h2(
         item_count,
         repeat_count,
     ) in rows:
-        interval = wilson_interval(int(repeat_count), int(item_count))
         entry = {
             "category_id": int(group_id),
             "category_name": group_name,
@@ -319,10 +379,8 @@ def _h2(
             "item_count": int(item_count),
             "reorder_count": int(repeat_count),
             "reorder_rate": float(repeat_count / item_count) if item_count else 0.0,
-            "confidence_interval": interval,
-            "confidence_interval_method": (
-                "Wilson score; replaced by customer bootstrap when estimable"
-            ),
+            "confidence_interval": None,
+            "confidence_interval_method": ("all-customer cluster bootstrap percentile"),
         }
         category_data[group_type].append(entry)
         connection.execute(
@@ -340,8 +398,8 @@ def _h2(
                 int(item_count),
                 int(repeat_count),
                 float(repeat_count / item_count) if item_count else 0.0,
-                interval[0] if interval else 0.0,
-                interval[1] if interval else 0.0,
+                None,
+                None,
             ),
         )
 
@@ -358,7 +416,7 @@ def _h2(
             dtype=np.int64,
         ).reshape((-1, 2))
         test = chi_square_summary(table)
-        user_matrix = _category_customer_matrix(connection, level, category_ids, sample_count)
+        user_matrix = _category_customer_matrix(connection, level, category_ids, customer_count)
         bootstrap = _bootstrap_contingency(
             user_matrix,
             len(category_ids),
@@ -371,25 +429,20 @@ def _h2(
             interval = (
                 category_rate_intervals[index] if index < len(category_rate_intervals) else None
             )
-            if interval is None:
-                interval = category["confidence_interval"]
             category["confidence_interval"] = interval
             connection.execute(
                 "UPDATE mart._hypothesis_categories SET ci_lower = %s, ci_upper = %s, metrics = %s "
                 "WHERE run_id = %s AND hypothesis_id = %s AND category_level = %s "
                 "AND category_id = %s AND eval_set = 'prior+train'",
                 (
-                    interval[0],
-                    interval[1],
+                    interval[0] if interval else None,
+                    interval[1] if interval else None,
                     Jsonb(
                         {
-                            "interval_method": (
-                                "customer bootstrap percentile"
-                                if index < len(category_rate_intervals)
-                                and category_rate_intervals[index]
-                                else "Wilson score fallback"
-                            ),
-                            "bootstrap_customers": sample_count,
+                            "interval_method": "all-customer cluster bootstrap percentile"
+                            if interval
+                            else "not estimable",
+                            "bootstrap_customers": customer_count,
                             "bootstrap_replicates": replicates,
                         }
                     ),
@@ -404,6 +457,10 @@ def _h2(
         hypothesis_id = "H2_department" if level == "department" else "H2_aisle"
         metrics = {
             **test,
+            "p_value_method": (
+                "Pearson chi-square on all prior/train positions; assumes independent positions"
+            ),
+            "effect_estimator": "Bergsma bias-corrected Cramér's V",
             "category_level": level,
             "categories": categories,
             "bootstrap": bootstrap,
@@ -417,23 +474,22 @@ def _h2(
             h0=f"Доля повторных покупок одинакова для всех {level}.",
             h1=f"Доля повторных покупок различается между {level}.",
             method=(
-                f"Критерий Пирсона χ² для {level} × reordered/not reordered; "
-                "bootstrap по покупателям."
+                f"Критерий Пирсона χ² на всех prior/train позициях по {level}; "
+                "эффект — V с конечновыборочной поправкой; CI — bootstrap по покупателям."
             ),
             observations=test["observations"],
             statistic=test["statistic"],
             p_value=test["p_value"],
-            effect_name="Cramér’s V",
+            effect_name="Bias-corrected Cramér’s V",
             effect_value=test["cramers_v"],
             ci=bootstrap["cramers_v_ci"],
             metrics=metrics,
-            interpretation=_interpret(test["p_value"], "Cramér’s V", test["cramers_v"]),
+            interpretation=_interpret(
+                test["p_value"], "bias-corrected Cramér’s V", test["cramers_v"]
+            ),
         )
-    p_values = [
-        test_summaries[level]["p_value"] if test_summaries[level]["p_value"] is not None else 1.0
-        for level in ("aisle", "department")
-    ]
-    adjusted = holm_adjust(p_values)
+    p_values = [test_summaries[level]["p_value"] for level in ("aisle", "department")]
+    adjusted = _holm_adjust_optional(p_values)
     for level, adjusted_p in zip(("aisle", "department"), adjusted, strict=True):
         connection.execute(
             "UPDATE mart._hypothesis_results SET metrics = metrics || %s "
@@ -509,21 +565,17 @@ def _pair_counts(connection: psycopg.Connection, first: int, second: int) -> dic
     return {key: int(value or 0) for key, value in zip(keys, row, strict=True)}
 
 
-def _mcnemar_from_counts(first_only: int, second_only: int) -> tuple[float, float]:
-    discordant = first_only + second_only
-    statistic = max(abs(first_only - second_only) - 1, 0) ** 2 / discordant if discordant else 0.0
-    from scipy.stats import chi2
-
-    return float(statistic), float(chi2.sf(statistic, 1)) if discordant else 1.0
-
-
-def _sample_customer_pair_rows(
-    connection: psycopg.Connection,
-) -> list[tuple[int, ...]]:
-    return connection.execute(
-        """
-        SELECT s.user_id,
+def _customer_pair_counts(connection: psycopg.Connection, customer_count: int) -> np.ndarray:
+    """Stream H3 per-customer counts into a compact fixed-width numeric array."""
+    values = np.zeros((customer_count, 13), dtype=np.int64)
+    with connection.cursor(name=f"analytics_h3_customers_{uuid.uuid4().hex}") as cursor:
+        cursor.execute(
+            """
+        SELECT s.customer_index,
                count(h.order_id)::BIGINT,
+               coalesce(sum(h.y1), 0)::BIGINT,
+               coalesce(sum(h.y10), 0)::BIGINT,
+               coalesce(sum(h.y20), 0)::BIGINT,
                coalesce(sum(h.y1 - h.y10), 0)::BIGINT,
                coalesce(sum(h.y1 - h.y20), 0)::BIGINT,
                coalesce(sum(h.y10 - h.y20), 0)::BIGINT,
@@ -534,15 +586,28 @@ def _sample_customer_pair_rows(
                count(*) FILTER (WHERE h.dept10 = h.dept20)::BIGINT,
                coalesce(sum(h.y10 - h.y20) FILTER (WHERE h.dept10 = h.dept20), 0)::BIGINT
         FROM tmp_analytics_users s LEFT JOIN tmp_h3_orders h USING (user_id)
-        GROUP BY s.user_id ORDER BY s.user_id
+        GROUP BY s.customer_index ORDER BY s.customer_index
         """
-    ).fetchall()
+        )
+        offset = 0
+        while batch := cursor.fetchmany(50_000):
+            matrix = np.asarray(batch, dtype=np.int64)
+            if matrix.shape[1] != values.shape[1] + 1:
+                raise ValueError("unexpected H3 customer aggregate shape")
+            indices = matrix[:, 0]
+            if np.any(indices < offset) or np.any(indices >= customer_count):
+                raise ValueError("H3 customer aggregates are not ordered or in range")
+            values[indices] = matrix[:, 1:]
+            offset = int(indices[-1]) + 1
+        if offset != customer_count:
+            raise ValueError("H3 customer aggregates do not cover the full population")
+    return values
 
 
 def _bootstrap_pair_differences(
-    rows: Sequence[Sequence[int]], replicates: int, random_seed: int
+    data: np.ndarray, replicates: int, random_seed: int
 ) -> dict[str, tuple[float, float] | None]:
-    if not rows:
+    if data.shape[0] == 0:
         return {
             name: None
             for name in (
@@ -554,33 +619,42 @@ def _bootstrap_pair_differences(
                 "10_vs_20_same_department",
             )
         }
-    data = np.asarray(rows, dtype=np.int64)
     pairs = (
-        ("1_vs_10", 1, 2),
-        ("1_vs_20", 1, 3),
-        ("10_vs_20", 1, 4),
-        ("1_vs_10_same_department", 5, 6),
-        ("1_vs_20_same_department", 7, 8),
-        ("10_vs_20_same_department", 9, 10),
+        ("1_vs_10", 0, 4),
+        ("1_vs_20", 0, 5),
+        ("10_vs_20", 0, 6),
+        ("1_vs_10_same_department", 7, 8),
+        ("1_vs_20_same_department", 9, 10),
+        ("10_vs_20_same_department", 11, 12),
     )
     result: dict[str, tuple[float, float] | None] = {}
-    weights = _bootstrap_weights(data.shape[0], replicates, random_seed)
-    for name, denominator_column, numerator_column in pairs:
-        values = []
-        for sample_weights in weights:
-            denominator = int(sample_weights @ data[:, denominator_column])
-            numerator = int(sample_weights @ data[:, numerator_column])
+    samples = {name: [] for name, _denominator, _numerator in pairs}
+    for sample_weights in _bootstrap_weights(data.shape[0], replicates, random_seed):
+        totals = sample_weights @ data
+        for name, denominator_column, numerator_column in pairs:
+            denominator = int(totals[denominator_column])
             if denominator:
-                values.append(numerator / denominator)
-        result[name] = percentile_interval(values)
+                samples[name].append(float(totals[numerator_column] / denominator))
+    for name, _denominator, _numerator in pairs:
+        result[name] = percentile_interval(samples[name])
     return result
+
+
+def _holm_adjust_optional(p_values: Sequence[float | None]) -> list[float | None]:
+    valid_positions = [index for index, value in enumerate(p_values) if value is not None]
+    adjusted: list[float | None] = [None] * len(p_values)
+    if valid_positions:
+        values = holm_adjust([float(p_values[index]) for index in valid_positions])
+        for index, value in zip(valid_positions, values, strict=True):
+            adjusted[index] = value
+    return adjusted
 
 
 def _h3(
     connection: psycopg.Connection,
     run_id: uuid.UUID,
     fingerprint: str,
-    sample_count: int,
+    customer_count: int,
     replicates: int,
     random_seed: int,
 ) -> dict[str, Any]:
@@ -608,20 +682,27 @@ def _h3(
         "20": r20 / orders if orders else None,
     }
 
-    samples = _sample_customer_pair_rows(connection) if sample_count else []
-    intervals = _bootstrap_pair_differences(samples, replicates, random_seed + 4)
+    customer_counts = _customer_pair_counts(connection, customer_count)
+    intervals = _bootstrap_pair_differences(customer_counts, replicates, random_seed + 4)
     counts_by_pair: dict[str, dict[str, Any]] = {}
     comparisons = ((1, 10), (1, 20), (10, 20))
-    raw_ps: list[float] = []
-    matched_ps: list[float] = []
+    raw_ps: list[float | None] = []
+    matched_ps: list[float | None] = []
     for first, second in comparisons:
         counts = _pair_counts(connection, first, second)
         name = f"{first}_vs_{second}"
-        stat, p_value = _mcnemar_from_counts(
-            counts["discordant_first_only"], counts["discordant_second_only"]
+        stat, p_value = (
+            mcnemar_from_counts(counts["discordant_first_only"], counts["discordant_second_only"])
+            if counts["orders"]
+            else (None, None)
         )
-        matched_stat, matched_p = _mcnemar_from_counts(
-            counts["same_department_first_only"], counts["same_department_second_only"]
+        matched_stat, matched_p = (
+            mcnemar_from_counts(
+                counts["same_department_first_only"],
+                counts["same_department_second_only"],
+            )
+            if counts["same_department_orders"]
+            else (None, None)
         )
         raw_ps.append(p_value)
         matched_ps.append(matched_p)
@@ -629,23 +710,27 @@ def _h3(
             **counts,
             "statistic": stat,
             "p_value": p_value,
-            "log10_p_value": log10_p_value(stat, 1, p_value),
+            "log10_p_value": log10_p_value(stat, 1, p_value)
+            if stat is not None and p_value is not None
+            else None,
             "risk_difference": counts["difference_sum"] / counts["orders"]
             if counts["orders"]
-            else 0.0,
+            else None,
             "same_department_statistic": matched_stat,
             "same_department_p_value": matched_p,
-            "same_department_log10_p_value": log10_p_value(matched_stat, 1, matched_p),
+            "same_department_log10_p_value": log10_p_value(matched_stat, 1, matched_p)
+            if matched_stat is not None and matched_p is not None
+            else None,
             "same_department_risk_difference": (
                 counts["same_department_difference_sum"] / counts["same_department_orders"]
                 if counts["same_department_orders"]
-                else 0.0
+                else None
             ),
             "bootstrap_ci": intervals[name],
             "same_department_bootstrap_ci": intervals[f"{name}_same_department"],
         }
-    adjusted = holm_adjust(raw_ps)
-    adjusted_matched = holm_adjust(matched_ps)
+    adjusted = _holm_adjust_optional(raw_ps)
+    adjusted_matched = _holm_adjust_optional(matched_ps)
     for index, (first, second) in enumerate(comparisons):
         name = f"{first}_vs_{second}"
         item = counts_by_pair[name]
@@ -703,25 +788,16 @@ def _h3(
                 ),
             )
 
-    rate_range = max((value for value in rates.values() if value is not None), default=0.0) - min(
-        (value for value in rates.values() if value is not None), default=0.0
-    )
-    # Bootstrap the overall range using per-customer event totals from the same sampled users.
-    customer_position_counts = connection.execute(
-        "SELECT s.user_id, count(h.order_id)::BIGINT, coalesce(sum(h.y1), 0)::BIGINT, "
-        "coalesce(sum(h.y10), 0)::BIGINT, coalesce(sum(h.y20), 0)::BIGINT "
-        "FROM tmp_analytics_users s LEFT JOIN tmp_h3_orders h USING (user_id) "
-        "GROUP BY s.user_id ORDER BY s.user_id"
-    ).fetchall()
+    nonempty_rates = [value for value in rates.values() if value is not None]
+    rate_range = max(nonempty_rates) - min(nonempty_rates) if nonempty_rates else None
     range_ci = None
-    if customer_position_counts:
-        values = np.asarray(customer_position_counts, dtype=np.int64)[:, 1:]
-        weights = _bootstrap_weights(values.shape[0], replicates, random_seed + 5)
+    if customer_count:
         ranges = []
-        for sample_weights in weights:
-            totals = sample_weights @ values
+        position_values = customer_counts[:, :4]
+        for sample_weights in _bootstrap_weights(customer_count, replicates, random_seed + 5):
+            totals = sample_weights @ position_values
             if totals[0]:
-                position_rates = totals[1:] / totals[0]
+                position_rates = totals[1:4] / totals[0]
                 ranges.append(float(position_rates.max() - position_rates.min()))
         range_ci = percentile_interval(ranges)
 
@@ -732,6 +808,12 @@ def _h3(
         "cochran_q": q_statistic,
         "cochran_q_p_value": q_p_value,
         "cochran_q_log10_p_value": q_log10_p_value,
+        "omnibus_p_value_method": (
+            "Cochran Q on eligible orders; assumes independent orders within customers too"
+        ),
+        "pairwise_p_value_method": (
+            "continuity-corrected McNemar; assumes independent pairs within customers too"
+        ),
         "pairwise_mcnemar": counts_by_pair,
         "holm_adjusted_p_values": {
             key: value for key, value in zip(counts_by_pair, adjusted, strict=True)
@@ -741,7 +823,7 @@ def _h3(
         },
         "bootstrap": {
             "sampling_unit": "customer",
-            "sampled_customers": sample_count,
+            "sampled_customers": customer_count,
             "replicates": replicates,
             "random_seed": random_seed + 4,
             "position_rate_range_ci": range_ci,
@@ -771,12 +853,21 @@ def _h3(
     )
 
     for row in connection.execute(
-        "SELECT eval_set, cart_position, category_level, category_id, category_name, "
-        "sum(item_count)::BIGINT, sum(reorder_count)::BIGINT "
-        "FROM mart.cart_position_stats "
-        "WHERE cart_position IN (1, 10, 20) AND category_level IN ('department', 'aisle') "
-        "GROUP BY eval_set, cart_position, category_level, category_id, category_name "
-        "ORDER BY category_level, category_id, eval_set, cart_position"
+        "SELECT om.eval_set, i.add_to_cart_order, cat.category_level, cat.category_id, "
+        "cat.category_name, count(*)::BIGINT, sum(i.reordered::INTEGER)::BIGINT "
+        "FROM tmp_h3_orders h JOIN mart.order_summary om USING (order_id) "
+        "JOIN core.order_items i USING (order_id) "
+        "JOIN core.products p USING (product_id) "
+        "JOIN core.aisles a USING (aisle_id) "
+        "JOIN core.departments d USING (department_id) "
+        "CROSS JOIN LATERAL (VALUES "
+        "('department'::TEXT, d.department_id::INTEGER, d.department_name), "
+        "('aisle'::TEXT, a.aisle_id::INTEGER, a.aisle_name)"
+        ") AS cat(category_level, category_id, category_name) "
+        "WHERE i.add_to_cart_order IN (1, 10, 20) "
+        "GROUP BY om.eval_set, i.add_to_cart_order, cat.category_level, cat.category_id, "
+        "cat.category_name ORDER BY cat.category_level, cat.category_id, om.eval_set, "
+        "i.add_to_cart_order"
     ).fetchall():
         eval_set, position, level, category_id, category_name, item_count, repeat_count = row
         interval = wilson_interval(int(repeat_count), int(item_count))
@@ -799,7 +890,14 @@ def _h3(
                 float(repeat_count / item_count) if item_count else 0.0,
                 interval[0] if interval else 0.0,
                 interval[1] if interval else 0.0,
-                Jsonb({"interval_method": "Wilson score"}),
+                Jsonb(
+                    {
+                        "interval_method": (
+                            "descriptive Wilson score; no customer-cluster adjustment"
+                        ),
+                        "category_scope": "same prior/train orders with basket_size >= 20",
+                    }
+                ),
             ),
         )
     return result_metrics

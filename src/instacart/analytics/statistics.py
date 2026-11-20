@@ -67,6 +67,8 @@ def chi_square_summary(table: Sequence[Sequence[int]] | np.ndarray) -> dict[str,
         "log10_p_value": None,
         "degrees_of_freedom": 0,
         "cramers_v": None,
+        "cramers_v_uncorrected": None,
+        "cramers_v_correction": "Bergsma finite-sample bias correction",
         "observed": observed.tolist(),
         "expected": expected.tolist(),
         "pearson_residuals": residuals.tolist(),
@@ -82,14 +84,29 @@ def chi_square_summary(table: Sequence[Sequence[int]] | np.ndarray) -> dict[str,
         expected_reduced
     )
     dimensions = min(int(active_rows.sum()) - 1, int(active_cols.sum()) - 1)
-    effect = float(np.sqrt(statistic / (total * dimensions))) if dimensions > 0 else None
+    raw_effect = float(np.sqrt(statistic / (total * dimensions))) if dimensions > 0 else None
+    corrected_effect = None
+    if dimensions > 0 and total > 1:
+        rows = int(active_rows.sum())
+        columns = int(active_cols.sum())
+        phi_squared = statistic / total
+        corrected_phi_squared = max(
+            0.0,
+            phi_squared - ((rows - 1) * (columns - 1)) / (total - 1),
+        )
+        corrected_rows = rows - ((rows - 1) ** 2) / (total - 1)
+        corrected_columns = columns - ((columns - 1) ** 2) / (total - 1)
+        corrected_dimensions = min(corrected_rows - 1, corrected_columns - 1)
+        if corrected_dimensions > 0:
+            corrected_effect = float(np.sqrt(corrected_phi_squared / corrected_dimensions))
     result.update(
         {
             "statistic": float(statistic),
             "p_value": float(p_value),
             "log10_p_value": log10_p_value(float(statistic), int(degrees), float(p_value)),
             "degrees_of_freedom": int(degrees),
-            "cramers_v": effect,
+            "cramers_v": corrected_effect,
+            "cramers_v_uncorrected": raw_effect,
             "expected": expected.tolist(),
             "pearson_residuals": residuals.tolist(),
         }
@@ -121,28 +138,40 @@ def log10_p_value(statistic: float, degrees_of_freedom: int, p_value: float) -> 
     return float(log_probability / log(10))
 
 
+def mcnemar_from_counts(first_only: int, second_only: int) -> tuple[float, float]:
+    """McNemar continuity-corrected statistic and p-value from discordant counts."""
+    if first_only < 0 or second_only < 0:
+        raise ValueError("discordant counts must be nonnegative")
+    discordant = first_only + second_only
+    statistic = max(abs(first_only - second_only) - 1, 0) ** 2 / discordant if discordant else 0.0
+    p_value = float(chi2.sf(statistic, 1)) if discordant else 1.0
+    return float(statistic), p_value
+
+
 def mcnemar_summary(first: Sequence[int], second: Sequence[int]) -> dict[str, Any]:
     """McNemar test with continuity correction for paired binary observations."""
-    first_values = np.asarray(first, dtype=np.int8)
-    second_values = np.asarray(second, dtype=np.int8)
+    first_values = np.asarray(first)
+    second_values = np.asarray(second)
     if first_values.shape != second_values.shape:
         raise ValueError("paired observations must have equal shapes")
+    if first_values.ndim != 1:
+        raise ValueError("paired observations must be one-dimensional")
     if np.any((first_values != 0) & (first_values != 1)) or np.any(
         (second_values != 0) & (second_values != 1)
     ):
         raise ValueError("paired outcomes must be binary")
+    first_values = first_values.astype(np.int8, copy=False)
+    second_values = second_values.astype(np.int8, copy=False)
     discordant_first = int(np.sum((first_values == 1) & (second_values == 0)))
     discordant_second = int(np.sum((first_values == 0) & (second_values == 1)))
-    discordant = discordant_first + discordant_second
-    statistic = (max(abs(discordant_first - discordant_second) - 1, 0) ** 2) / discordant
-    p_value = float(chi2.sf(statistic, 1)) if discordant else 1.0
-    difference = float(np.mean(first_values - second_values)) if first_values.size else 0.0
+    statistic, p_value = mcnemar_from_counts(discordant_first, discordant_second)
+    difference = float(np.mean(first_values - second_values)) if first_values.size else None
     return {
         "observations": int(first_values.size),
         "discordant_first_only": discordant_first,
         "discordant_second_only": discordant_second,
-        "statistic": float(statistic),
-        "p_value": p_value,
+        "statistic": statistic if first_values.size else None,
+        "p_value": p_value if first_values.size else None,
         "risk_difference": difference,
     }
 

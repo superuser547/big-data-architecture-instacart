@@ -49,8 +49,21 @@ def analytics_markdown(payload: dict[str, Any]) -> str:
         f"- Статус: `{payload.get('status', 'unknown')}`",
         f"- Сформирован: {payload.get('generated_at', 'не указано')}",
         f"- Fingerprint набора: `{payload.get('dataset_fingerprint', 'не указан')}`",
+        f"- Импорт: `{payload.get('ingestion_run_id', 'не указан')}`",
+        f"- Запуск витрин: `{payload.get('marts_run_id', 'не указан')}`",
+        f"- Запуск анализа: `{payload.get('analytics_run_id', 'не указан')}`",
         f"- Длительность: {payload.get('duration_seconds', 'не указана')} с",
     ]
+    if payload.get("mart_size_bytes") is not None:
+        lines.append(f"- Размер схемы `mart`: {payload['mart_size_bytes']} байт")
+    stages = payload.get("stage_durations_seconds", {})
+    if stages:
+        lines.extend(
+            [
+                "- Время этапов: "
+                + "; ".join(f"{name} — {value} с" for name, value in stages.items())
+            ]
+        )
     row_counts = payload.get("row_counts")
     if row_counts:
         lines.extend(
@@ -62,12 +75,19 @@ def analytics_markdown(payload: dict[str, Any]) -> str:
         lines.extend(["", "## Проверка гипотез", ""])
         h1 = hypotheses.get("H1", {})
         if h1:
+            bootstrap = h1.get("bootstrap", {})
             lines.extend(
                 [
                     "### H1. День недели и час заказа",
                     "",
                     _table(
-                        ("Заказы", "χ²", "p-value", "Cramér’s V", "95% CI V"),
+                        (
+                            "Заказы",
+                            "χ²",
+                            "Базовый p-value",
+                            "Скорректированный Cramér’s V",
+                            "95% CI V",
+                        ),
                         [
                             (
                                 h1.get("observations"),
@@ -78,6 +98,11 @@ def analytics_markdown(payload: dict[str, Any]) -> str:
                             )
                         ],
                     ),
+                    "",
+                    f"Базовый тест: {h1.get('p_value_method', 'не указан')}. Интервал эффекта — "
+                    f"bootstrap по {bootstrap.get('sampled_customers', 'неизвестно')} покупателям, "
+                    f"{bootstrap.get('replicates', 'неизвестно')} повторов, seed "
+                    f"{bootstrap.get('random_seed', 'не указан')}.",
                     "",
                     h1.get("interpretation", ""),
                 ]
@@ -90,7 +115,14 @@ def analytics_markdown(payload: dict[str, Any]) -> str:
                     "### H2. Категория и повторная покупка",
                     "",
                     _table(
-                        ("Уровень", "Позиции", "χ²", "p-value", "Cramér’s V", "Bootstrap 95% CI"),
+                        (
+                            "Уровень",
+                            "Позиции",
+                            "χ²",
+                            "Базовый p-value",
+                            "Скорректированный Cramér’s V",
+                            "Bootstrap 95% CI",
+                        ),
                         [
                             (
                                 level,
@@ -103,6 +135,10 @@ def analytics_markdown(payload: dict[str, Any]) -> str:
                             for level, values in h2.get("tests", {}).items()
                         ],
                     ),
+                    "",
+                    "Базовые p-value χ² рассчитаны на всех позициях `prior`/`train` без "
+                    "поправки на повторные наблюдения покупателей. Доверительные интервалы "
+                    "долей и эффекта получены bootstrap по покупателям.",
                     "",
                     "Детальные доли и интервалы по departments и aisles доступны "
                     "в PostgreSQL и JSON.",
@@ -134,6 +170,17 @@ def analytics_markdown(payload: dict[str, Any]) -> str:
                     f"p = {_p_value(h3.get('cochran_q_p_value'))}; "
                     f"размах долей = {h3.get('position_rate_range')}; "
                     f"bootstrap 95% CI = {h3.get('bootstrap', {}).get('position_rate_range_ci')}.",
+                    "",
+                    _table(
+                        ("Позиция", "Доля повторных покупок"),
+                        h3.get("position_reorder_rates", {}).items(),
+                    ),
+                    "",
+                    "Базовые p-value критериев Кокрана Q и Мак-Немара рассчитаны по "
+                    "полным когортам заказов; они не корректируют зависимость между "
+                    "заказами одного покупателя. Интервалы разностей получены bootstrap "
+                    "по всем покупателям. Категориальные детали ограничены теми же "
+                    "заказами с корзиной не менее 20 и являются описательными.",
                     "",
                     _table(
                         (

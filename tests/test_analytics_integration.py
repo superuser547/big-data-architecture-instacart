@@ -204,13 +204,15 @@ def test_marts_analysis_idempotency_rollback_and_staleness(monkeypatch: pytest.M
         settings,
         random_seed=2026,
         bootstrap_replicates=10,
-        bootstrap_customer_sample=12,
         silhouette_sample_size=12,
     )
     assert first["clustering"]["customer_count"] == 12
     assert 2 <= first["clustering"]["selected_k"] <= 8
     assert first["hypotheses"]["H1"]["observations"] == 36
     assert first["hypotheses"]["H3"]["orders_with_basket_size_at_least_20"] == 23
+    position_range_ci = first["hypotheses"]["H3"]["bootstrap"]["position_rate_range_ci"]
+    assert position_range_ci is not None
+    assert 0 <= position_range_ci[0] <= position_range_ci[1] <= 1
     with psycopg.connect(dsn) as connection:
         assert connection.execute("SELECT count(*) FROM mart.customer_segments").fetchone()[0] == 12
         assert connection.execute("SELECT count(*) FROM mart.hypothesis_pairs").fetchone()[0] == 6
@@ -230,7 +232,6 @@ def test_marts_analysis_idempotency_rollback_and_staleness(monkeypatch: pytest.M
             settings,
             random_seed=2026,
             bootstrap_replicates=10,
-            bootstrap_customer_sample=12,
             silhouette_sample_size=12,
         )
     monkeypatch.setattr(analytics_service, "cluster_customers", original_cluster)
@@ -247,7 +248,6 @@ def test_marts_analysis_idempotency_rollback_and_staleness(monkeypatch: pytest.M
         settings,
         random_seed=2026,
         bootstrap_replicates=10,
-        bootstrap_customer_sample=12,
         silhouette_sample_size=12,
     )
     with psycopg.connect(dsn) as connection:
@@ -258,10 +258,80 @@ def test_marts_analysis_idempotency_rollback_and_staleness(monkeypatch: pytest.M
         assert connection.execute("SELECT count(*) FROM mart.cluster_metrics").fetchone()[0] == 7
         assert segments == first_segments
     assert first["clustering"]["selected_k"] == second["clustering"]["selected_k"]
+    assert first["hypotheses"]["customer_bootstrap"]["sampled_customers"] == 12
+
+    with psycopg.connect(dsn) as connection:
+        h3_items = connection.execute(
+            "SELECT category_level, cart_position, sum(item_count)::BIGINT "
+            "FROM mart.hypothesis_categories WHERE hypothesis_id = 'H3_category' "
+            "GROUP BY category_level, cart_position ORDER BY category_level, cart_position"
+        ).fetchall()
+        assert h3_items == [
+            (level, position, 23) for level in ("aisle", "department") for position in (1, 10, 20)
+        ]
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM mart.hypothesis_categories "
+                "WHERE hypothesis_id = 'H3_category' AND eval_set = 'test'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert connection.execute("SELECT dashboard_ready FROM ops.analytics_readiness").fetchone()[
+            0
+        ]
 
     validation = validate_analytics(settings)
     assert validation["passed"] is True
     assert validation["active_dataset_fingerprint"] == fingerprint
+    assert validation["dashboard_ready"] is True
+
+    # A failed mart rebuild keeps the previously published marts and analysis visible.
+    monkeypatch.setattr(analytics_service, "_build_marts", fail_marts)
+    with pytest.raises(RuntimeError, match="injected marts failure"):
+        build_marts(settings)
+    monkeypatch.setattr(analytics_service, "_build_marts", original_build_marts)
+    with psycopg.connect(dsn) as connection:
+        assert connection.execute("SELECT count(*) FROM mart.dataset_overview").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM mart.hypothesis_results").fetchone()[0] == 4
+        assert connection.execute("SELECT dashboard_ready FROM ops.analytics_readiness").fetchone()[
+            0
+        ]
+
+    # A successful mart generation invalidates the previous analysis even when the
+    # active import and its fingerprint have not changed.
+    repeated_marts = build_marts(settings)
+    assert repeated_marts["row_counts"] == marts["row_counts"]
+    assert validate_analytics(settings)["dashboard_ready"] is False
+    with psycopg.connect(dsn) as connection:
+        assert connection.execute("SELECT count(*) FROM mart.dataset_overview").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM mart.hypothesis_results").fetchone()[0] == 0
+        readiness = connection.execute(
+            "SELECT marts_ready, analysis_ready, dashboard_ready FROM ops.analytics_readiness"
+        ).fetchone()
+        assert readiness == (True, False, False)
+    analyze(settings, random_seed=2026, bootstrap_replicates=10, silhouette_sample_size=12)
+    assert validate_analytics(settings)["dashboard_ready"] is True
+
+    # Import identity participates in lineage even when the content fingerprint is equal.
+    with psycopg.connect(dsn) as connection:
+        same_fingerprint_run = uuid.uuid4()
+        connection.execute(
+            "INSERT INTO ops.ingestion_runs "
+            "(run_id, dataset_fingerprint, status, finished_at) "
+            "VALUES (%s, %s, 'succeeded', clock_timestamp())",
+            (same_fingerprint_run, fingerprint),
+        )
+        connection.execute(
+            "UPDATE ops.active_dataset SET run_id = %s WHERE singleton",
+            (same_fingerprint_run,),
+        )
+        assert connection.execute("SELECT count(*) FROM mart.dataset_overview").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM mart.hypothesis_results").fetchone()[0] == 0
+    assert validate_analytics(settings)["dashboard_ready"] is False
+    build_marts(settings)
+    assert validate_analytics(settings)["dashboard_ready"] is False
+    analyze(settings, random_seed=2026, bootstrap_replicates=10, silhouette_sample_size=12)
+    assert validate_analytics(settings)["dashboard_ready"] is True
 
     with psycopg.connect(dsn) as connection:
         next_run = uuid.uuid4()

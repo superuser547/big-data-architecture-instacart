@@ -15,12 +15,16 @@ def build_marts(
     connection: psycopg.Connection,
     run_id: uuid.UUID,
     fingerprint: str,
+    ingestion_run_id: uuid.UUID,
 ) -> dict[str, int]:
     """Rebuild all SQL aggregates in the caller's transaction."""
     previous = connection.execute(
-        "SELECT dataset_fingerprint FROM ops.analytics_state WHERE singleton"
+        "SELECT dataset_fingerprint, active_ingestion_run_id "
+        "FROM ops.analytics_state WHERE singleton"
     ).fetchone()
-    changed_dataset = previous is not None and previous[0] != fingerprint
+    changed_dataset = previous is not None and (
+        previous[0] != fingerprint or previous[1] != ingestion_run_id
+    )
     for table in (
         "_dataset_overview",
         "_order_activity",
@@ -298,12 +302,13 @@ def build_marts(
         "customer_features": _count(connection, "mart._customer_features"),
     }
     connection.execute(
-        "INSERT INTO ops.analytics_state (singleton, dataset_fingerprint, marts_run_id, "
-        "analysis_run_id) VALUES (TRUE, %s, %s, NULL) ON CONFLICT (singleton) DO UPDATE SET "
-        "dataset_fingerprint = EXCLUDED.dataset_fingerprint, marts_run_id = EXCLUDED.marts_run_id, "
-        "analysis_run_id = CASE WHEN ops.analytics_state.dataset_fingerprint "
-        "= EXCLUDED.dataset_fingerprint "
-        "THEN ops.analytics_state.analysis_run_id ELSE NULL END, updated_at = clock_timestamp()",
-        (fingerprint, run_id),
+        "INSERT INTO ops.analytics_state (singleton, dataset_fingerprint, "
+        "active_ingestion_run_id, marts_run_id, analysis_run_id) "
+        "VALUES (TRUE, %s, %s, %s, NULL) ON CONFLICT (singleton) DO UPDATE SET "
+        "dataset_fingerprint = EXCLUDED.dataset_fingerprint, "
+        "active_ingestion_run_id = EXCLUDED.active_ingestion_run_id, "
+        "marts_run_id = EXCLUDED.marts_run_id, analysis_run_id = NULL, "
+        "updated_at = clock_timestamp()",
+        (fingerprint, ingestion_run_id, run_id),
     )
     return counts

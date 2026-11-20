@@ -65,6 +65,9 @@ uv run instacart ingest --dataset data/raw --force
 сам и работает на синтетических CSV. Отчёты аналитики создаются в JSON и Markdown;
 пути и параметры выборки настраиваются переменными `ANALYTICS_REPORT`,
 `ANALYTICS_MARKDOWN_REPORT`, `ANALYTICS_RANDOM_SEED`, `BOOTSTRAP_REPLICATES`,
-`BOOTSTRAP_CUSTOMER_SAMPLE` и `SILHOUETTE_SAMPLE_SIZE`. `make analyze` требует
-актуальные витрины от `make marts`; `make validate-analytics` проверяет публикацию
-и fingerprint, поэтому скрытые устаревшие данные не считаются актуальными.
+`SILHOUETTE_SAMPLE_SIZE`. Bootstrap-интервалы рассчитываются по всей активной
+совокупности покупателей. `make analyze` требует актуальные витрины от
+`make marts`; после успешного обновления витрин анализ следует выполнить заново.
+`make validate-analytics` проверяет цепочку идентификатора активного импорта,
+fingerprint, витрин и анализа; `ops.analytics_readiness.dashboard_ready` явно
+указывает, доступны ли согласованные данные для дашборда.

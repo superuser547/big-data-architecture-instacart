@@ -28,6 +28,20 @@ FEATURES = (
 LOG_FEATURES = tuple(name for name in FEATURES if name != "reorder_rate")
 
 
+def _candidate_k_values(customer_count: int, distinct_count: int) -> range:
+    if customer_count < 3:
+        raise ValueError(
+            "Для кластеризации нужны данные как минимум трёх покупателей с заказами prior"
+        )
+    if distinct_count < 2:
+        raise ValueError("Кластеризация невозможна: признаки покупателей не различаются")
+    return range(2, min(8, customer_count - 1, distinct_count) + 1)
+
+
+def _silhouette_is_estimable(sampled_label_count: int, sample_size: int) -> bool:
+    return 2 <= sampled_label_count < sample_size
+
+
 def _json_number(value: Any) -> float | None:
     return float(value) if pd.notna(value) else None
 
@@ -61,9 +75,7 @@ def cluster_customers(
         "unique_department_count FROM mart.customer_features ORDER BY user_id"
     ).fetchall()
     if len(rows) < 3:
-        raise ValueError(
-            "Для кластеризации нужны данные как минимум трёх покупателей с заказами prior"
-        )
+        _candidate_k_values(len(rows), 0)
     frame = pd.DataFrame.from_records(rows, columns=("user_id", *FEATURES))
     raw_summary = _raw_feature_summary(frame)
     raw = frame.loc[:, list(FEATURES)].astype("float64").copy()
@@ -76,22 +88,37 @@ def cluster_customers(
     scaled = scaler.fit_transform(transformed)
 
     count = len(frame)
-    score_size = min(count, max(2, silhouette_sample_size))
+    distinct_count = int(np.unique(scaled, axis=0).shape[0])
+    candidates = _candidate_k_values(count, distinct_count)
+    score_size = min(count, max(3, silhouette_sample_size))
     sample_indices = np.random.default_rng(random_seed).choice(
         count, size=score_size, replace=False
     )
-    candidates = range(2, min(8, count - 1) + 1)
     models: dict[int, KMeans] = {}
     metrics: list[dict[str, Any]] = []
+    skipped_candidates: list[dict[str, Any]] = []
     with threadpool_limits(limits=2):
         for k in candidates:
             model = KMeans(n_clusters=k, n_init=10, random_state=random_seed, algorithm="lloyd")
             labels = model.fit_predict(scaled)
             sampled_labels = labels[sample_indices]
+            label_count = int(np.unique(labels).size)
+            sampled_label_count = int(np.unique(sampled_labels).size)
+            if label_count != k:
+                skipped_candidates.append(
+                    {"k": k, "reason": "K-Means produced fewer than k distinct clusters"}
+                )
+                continue
+            if not _silhouette_is_estimable(sampled_label_count, score_size):
+                skipped_candidates.append(
+                    {"k": k, "reason": "silhouette is undefined on the representative sample"}
+                )
+                continue
             try:
                 silhouette = float(silhouette_score(scaled[sample_indices], sampled_labels))
-            except ValueError:
-                silhouette = -1.0
+            except ValueError as exc:
+                skipped_candidates.append({"k": k, "reason": str(exc)})
+                continue
             sizes = np.bincount(labels, minlength=k)
             models[k] = model
             metrics.append(
@@ -104,6 +131,9 @@ def cluster_customers(
                     "minimum_cluster_size": int(sizes.min()),
                 }
             )
+    if not metrics:
+        reasons = "; ".join(item["reason"] for item in skipped_candidates)
+        raise ValueError(f"Не найдено допустимое разбиение для оценки кластеризации: {reasons}")
     min_size = max(20, int(np.ceil(count * 0.005)))
     eligible = [item for item in metrics if item["minimum_cluster_size"] >= min_size]
     selection_basis = "maximum sampled silhouette with every cluster >= 0.5% of customers or 20"
@@ -186,6 +216,7 @@ def cluster_customers(
         "selected_k": selected_k,
         "selection_basis": selection_basis,
         "metrics": metrics,
+        "skipped_candidates": skipped_candidates,
         "profiles": [
             {
                 "cluster_id": cluster_id,

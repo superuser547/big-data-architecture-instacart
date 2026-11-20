@@ -46,13 +46,18 @@
 представлениями, пока новые расчёты не зафиксированы.
 
 `make analyze` принимает параметры `ANALYTICS_RANDOM_SEED` (по умолчанию 2026),
-`BOOTSTRAP_REPLICATES` (200), `BOOTSTRAP_CUSTOMER_SAMPLE` (10 000) и
-`SILHOUETTE_SAMPLE_SIZE` (5 000). Переменные `ANALYTICS_REPORT` и
+`BOOTSTRAP_REPLICATES` (200) и `SILHOUETTE_SAMPLE_SIZE` (5 000). Bootstrap
+выполняется по всем покупателям активного импорта; в память за один шаг
+загружается один вектор весов, а подготовленные H1/H2 агрегаты хранятся
+разреженно. Переменные `ANALYTICS_REPORT` и
 `ANALYTICS_MARKDOWN_REPORT` задают локальные отчёты JSON и Markdown. Они
 располагаются в исключённом из Git каталоге `reports/`. Журнал запусков и
 сводные результаты также доступны через `ops.analytics_runs` и витрины PostgreSQL.
 
 `make validate-analytics` завершится ошибкой, если импорт отсутствует, витрины не
 построены, результаты устарели или автоматические проверки согласованности не
-пройдены. Смена fingerprint скрывает прежние аналитические данные до их
-пересчёта.
+пройдены. Актуальность проверяется по цепочке `active ingestion_run_id +
+fingerprint → marts_run_id → analysis_run_id`. Успешная пересборка витрин
+требует нового `make analyze`, даже если fingerprint не менялся. Представление
+`ops.analytics_readiness` содержит состояния витрин, анализа и итоговый
+`dashboard_ready`; публичные представления `mart` скрывают несовпадающие версии.

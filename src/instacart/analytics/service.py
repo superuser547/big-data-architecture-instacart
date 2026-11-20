@@ -38,12 +38,13 @@ def _start_run(
     ingestion_run_id: uuid.UUID,
     run_type: str,
     parameters: dict[str, Any],
+    marts_run_id: uuid.UUID | None = None,
 ) -> None:
     connection.execute(
         "INSERT INTO ops.analytics_runs "
-        "(analytics_run_id, dataset_fingerprint, ingestion_run_id, run_type, status, parameters) "
-        "VALUES (%s, %s, %s, %s, 'running', %s)",
-        (run_id, fingerprint, ingestion_run_id, run_type, Jsonb(parameters)),
+        "(analytics_run_id, dataset_fingerprint, ingestion_run_id, marts_run_id, run_type, "
+        "status, parameters) VALUES (%s, %s, %s, %s, %s, 'running', %s)",
+        (run_id, fingerprint, ingestion_run_id, marts_run_id, run_type, Jsonb(parameters)),
     )
 
 
@@ -73,15 +74,19 @@ def _mark_failed(
     )
 
 
-def _fresh_marts(connection: psycopg.Connection, fingerprint: str) -> tuple[uuid.UUID, str] | None:
+def _fresh_marts(
+    connection: psycopg.Connection, fingerprint: str, ingestion_run_id: uuid.UUID
+) -> uuid.UUID | None:
     row = connection.execute(
-        "SELECT s.marts_run_id, r.status FROM ops.analytics_state s "
+        "SELECT s.marts_run_id FROM ops.analytics_state s "
         "JOIN ops.analytics_runs r ON r.analytics_run_id = s.marts_run_id "
-        "WHERE s.singleton AND s.dataset_fingerprint = %s AND r.status = 'succeeded' "
-        "AND r.run_type = 'marts' AND r.dataset_fingerprint = %s",
-        (fingerprint, fingerprint),
+        "WHERE s.singleton AND s.dataset_fingerprint = %s "
+        "AND s.active_ingestion_run_id = %s AND r.status = 'succeeded' "
+        "AND r.run_type = 'marts' AND r.dataset_fingerprint = %s "
+        "AND r.ingestion_run_id = %s",
+        (fingerprint, ingestion_run_id, fingerprint, ingestion_run_id),
     ).fetchone()
-    return (row[0], row[1]) if row else None
+    return row[0] if row else None
 
 
 def build_marts(settings: Settings) -> dict[str, Any]:
@@ -109,8 +114,8 @@ def build_marts(settings: Settings) -> dict[str, Any]:
         _start_run(lock_connection, run_id, fingerprint, ingestion_run_id, "marts", parameters)
         try:
             with connect(settings) as connection, connection.transaction():
-                counts = _build_marts(connection, run_id, fingerprint)
-                checks = _validate_marts(connection, fingerprint, counts)
+                counts = _build_marts(connection, run_id, fingerprint, ingestion_run_id)
+                checks = _validate_marts(connection, run_id, fingerprint, ingestion_run_id, counts)
                 failed = [check["name"] for check in checks if not check["passed"]]
                 if failed:
                     raise RuntimeError(f"Проверки витрин не пройдены: {', '.join(failed)}")
@@ -158,7 +163,11 @@ def build_marts(settings: Settings) -> dict[str, Any]:
 
 
 def _validate_marts(
-    connection: psycopg.Connection, fingerprint: str, counts: dict[str, int]
+    connection: psycopg.Connection,
+    run_id: uuid.UUID,
+    fingerprint: str,
+    ingestion_run_id: uuid.UUID,
+    counts: dict[str, int],
 ) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
 
@@ -166,14 +175,14 @@ def _validate_marts(
         checks.append({"name": name, "passed": bool(passed), "detail": detail})
 
     overview = connection.execute(
-        "SELECT known_order_count, known_item_count, repeat_numerator FROM mart.dataset_overview "
-        "WHERE dataset_fingerprint = %s",
-        (fingerprint,),
+        "SELECT known_order_count, known_item_count, repeat_numerator "
+        "FROM mart._dataset_overview WHERE run_id = %s AND dataset_fingerprint = %s",
+        (run_id, fingerprint),
     ).fetchone()
     summary = connection.execute(
         "SELECT count(*), coalesce(sum(basket_size), 0), coalesce(sum(repeat_count), 0) "
-        "FROM mart.order_summary WHERE dataset_fingerprint = %s",
-        (fingerprint,),
+        "FROM mart._order_summary WHERE run_id = %s AND dataset_fingerprint = %s",
+        (run_id, fingerprint),
     ).fetchone()
     add(
         "order_summary_matches_overview",
@@ -184,8 +193,9 @@ def _validate_marts(
     )
     categorized = connection.execute(
         "SELECT coalesce(sum(item_count), 0), coalesce(sum(reorder_count), 0) "
-        "FROM mart.department_reorders WHERE group_type = 'department' "
-        "AND eval_set IN ('prior', 'train')"
+        "FROM mart._department_reorders WHERE run_id = %s AND group_type = 'department' "
+        "AND eval_set IN ('prior', 'train')",
+        (run_id,),
     ).fetchone()
     add(
         "category_totals_match_overview",
@@ -196,8 +206,9 @@ def _validate_marts(
     )
     cross_filter_totals = connection.execute(
         "SELECT coalesce(sum(item_count), 0), coalesce(sum(reorder_count), 0) "
-        "FROM mart.category_activity WHERE category_level = 'department' "
-        "AND eval_set IN ('prior', 'train')"
+        "FROM mart._category_activity WHERE run_id = %s AND category_level = 'department' "
+        "AND eval_set IN ('prior', 'train')",
+        (run_id,),
     ).fetchone()
     add(
         "category_activity_totals_match_overview",
@@ -207,7 +218,8 @@ def _validate_marts(
         "кросс-фильтруемая витрина категорий совпадает с количеством известных позиций",
     )
     test_items = connection.execute(
-        "SELECT count(*) FROM mart.order_summary WHERE eval_set = 'test'"
+        "SELECT count(*) FROM mart._order_summary WHERE run_id = %s AND eval_set = 'test'",
+        (run_id,),
     ).fetchone()[0]
     add(
         "test_orders_excluded_from_known_baskets",
@@ -217,9 +229,12 @@ def _validate_marts(
     add(
         "active_fingerprint",
         connection.execute(
-            "SELECT EXISTS (SELECT 1 FROM ops.active_dataset "
-            "WHERE singleton AND dataset_fingerprint = %s)",
-            (fingerprint,),
+            "SELECT EXISTS (SELECT 1 FROM ops.active_dataset a "
+            "JOIN ops.analytics_state s ON s.singleton "
+            "WHERE a.singleton AND a.dataset_fingerprint = %s AND a.run_id = %s "
+            "AND s.dataset_fingerprint = a.dataset_fingerprint "
+            "AND s.active_ingestion_run_id = a.run_id AND s.marts_run_id = %s)",
+            (fingerprint, ingestion_run_id, run_id),
         ).fetchone()[0],
         "витрины построены для активного fingerprint",
     )
@@ -241,7 +256,6 @@ def analyze(
     *,
     random_seed: int = 2026,
     bootstrap_replicates: int = 200,
-    bootstrap_customer_sample: int = 10_000,
     silhouette_sample_size: int = 5_000,
 ) -> dict[str, Any]:
     """Run hypotheses and K-Means on a fresh marts snapshot, then publish atomically."""
@@ -252,7 +266,6 @@ def analyze(
     parameters = {
         "random_seed": random_seed,
         "bootstrap_replicates": bootstrap_replicates,
-        "bootstrap_customer_sample": bootstrap_customer_sample,
         "silhouette_sample_size": silhouette_sample_size,
         "alpha": 0.05,
         "cluster_k_range": [2, 8],
@@ -269,20 +282,28 @@ def analyze(
                 "Нет успешного активного импорта в core. Сначала выполните make ingest."
             )
         fingerprint, ingestion_run_id = active
-        marts = _fresh_marts(lock_connection, fingerprint)
-        if marts is None:
+        marts_run_id = _fresh_marts(lock_connection, fingerprint, ingestion_run_id)
+        if marts_run_id is None:
             raise AnalyticsDataUnavailable(
                 "Для активного набора нет актуальных витрин. Сначала выполните make marts."
             )
-        _start_run(lock_connection, run_id, fingerprint, ingestion_run_id, "analysis", parameters)
+        _start_run(
+            lock_connection,
+            run_id,
+            fingerprint,
+            ingestion_run_id,
+            "analysis",
+            parameters,
+            marts_run_id=marts_run_id,
+        )
         marts_results = lock_connection.execute(
             "SELECT results FROM ops.analytics_runs WHERE analytics_run_id = %s",
-            (marts[0],),
+            (marts_run_id,),
         ).fetchone()[0]
         try:
             with connect(settings) as connection, connection.transaction():
-                current = _fresh_marts(connection, fingerprint)
-                if current is None:
+                current_marts_run_id = _fresh_marts(connection, fingerprint, ingestion_run_id)
+                if current_marts_run_id is None:
                     raise AnalyticsDataUnavailable(
                         "Витрины устарели до начала анализа; выполните make marts."
                     )
@@ -311,20 +332,24 @@ def analyze(
                     fingerprint,
                     random_seed=random_seed,
                     bootstrap_replicates=bootstrap_replicates,
-                    bootstrap_customer_sample=bootstrap_customer_sample,
                 )
                 hypotheses_duration = round(time.monotonic() - hypotheses_started, 3)
-                connection.execute(
+                published = connection.execute(
                     "UPDATE ops.analytics_state SET analysis_run_id = %s, "
                     "updated_at = clock_timestamp() "
-                    "WHERE singleton AND dataset_fingerprint = %s AND marts_run_id = %s",
-                    (run_id, fingerprint, current[0]),
+                    "WHERE singleton AND dataset_fingerprint = %s AND marts_run_id = %s "
+                    "AND active_ingestion_run_id = %s",
+                    (run_id, fingerprint, current_marts_run_id, ingestion_run_id),
                 )
+                if published.rowcount != 1:
+                    raise AnalyticsDataUnavailable(
+                        "Активный импорт или поколение витрин изменились во время анализа."
+                    )
                 result = {
                     "analytics_run_id": str(run_id),
                     "dataset_fingerprint": fingerprint,
                     "ingestion_run_id": str(ingestion_run_id),
-                    "marts_run_id": str(current[0]),
+                    "marts_run_id": str(current_marts_run_id),
                     "parameters": parameters,
                     "row_counts": {
                         **marts_results.get("row_counts", {}),
@@ -403,7 +428,7 @@ def validate_analytics(settings: Settings) -> dict[str, Any]:
         connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         active = _active_dataset(connection)
         state = connection.execute(
-            "SELECT dataset_fingerprint, marts_run_id, analysis_run_id "
+            "SELECT dataset_fingerprint, active_ingestion_run_id, marts_run_id, analysis_run_id "
             "FROM ops.analytics_state WHERE singleton"
         ).fetchone()
         checks: list[dict[str, Any]] = []
@@ -421,6 +446,7 @@ def validate_analytics(settings: Settings) -> dict[str, Any]:
                 "status": "stale_or_missing",
                 "passed": False,
                 "stale": True,
+                "dashboard_ready": False,
                 "checks": checks,
                 "duration_seconds": round(time.monotonic() - started, 3),
             }
@@ -435,19 +461,27 @@ def validate_analytics(settings: Settings) -> dict[str, Any]:
                 "status": "stale_or_missing",
                 "passed": False,
                 "stale": True,
+                "dashboard_ready": False,
                 "active_dataset_fingerprint": fingerprint,
                 "ingestion_run_id": str(ingestion_run_id),
                 "checks": checks,
                 "duration_seconds": round(time.monotonic() - started, 3),
             }
-        state_fingerprint, marts_run_id, analysis_run_id = state
+        state_fingerprint, state_ingestion_run_id, marts_run_id, analysis_run_id = state
+        state_import_current = state_ingestion_run_id == ingestion_run_id
         add(
             "dataset_fingerprint_current",
             state_fingerprint == fingerprint,
             f"active={fingerprint}; analytics={state_fingerprint}",
         )
+        add(
+            "ingestion_run_id_current",
+            state_import_current,
+            f"active={ingestion_run_id}; analytics={state_ingestion_run_id}",
+        )
         run_rows = connection.execute(
-            "SELECT analytics_run_id, run_type, status, dataset_fingerprint, finished_at, results "
+            "SELECT analytics_run_id, run_type, status, dataset_fingerprint, ingestion_run_id, "
+            "marts_run_id, finished_at, results "
             "FROM ops.analytics_runs WHERE analytics_run_id = ANY(%s)",
             ([marts_run_id, analysis_run_id] if analysis_run_id else [marts_run_id],),
         ).fetchall()
@@ -461,6 +495,8 @@ def validate_analytics(settings: Settings) -> dict[str, Any]:
                 and marts_run[1] == "marts"
                 and marts_run[2] == "succeeded"
                 and marts_run[3] == fingerprint
+                and marts_run[4] == ingestion_run_id
+                and state_import_current
             ),
             "последний запуск SQL-витрин успешен и связан с активным набором",
         )
@@ -471,8 +507,40 @@ def validate_analytics(settings: Settings) -> dict[str, Any]:
                 and analysis_run[1] == "analysis"
                 and analysis_run[2] == "succeeded"
                 and analysis_run[3] == fingerprint
+                and analysis_run[4] == ingestion_run_id
+                and analysis_run[5] == marts_run_id
+                and state_import_current
             ),
             "проверки гипотез и кластеризация опубликованы для активного набора",
+        )
+        marts_ready = bool(
+            marts_run
+            and state_fingerprint == fingerprint
+            and marts_run[1] == "marts"
+            and marts_run[2] == "succeeded"
+            and marts_run[3] == fingerprint
+            and marts_run[4] == ingestion_run_id
+            and state_import_current
+        )
+        dashboard_ready = bool(
+            marts_ready
+            and analysis_run
+            and analysis_run[1] == "analysis"
+            and analysis_run[2] == "succeeded"
+            and analysis_run[3] == fingerprint
+            and analysis_run[4] == ingestion_run_id
+            and analysis_run[5] == marts_run_id
+        )
+        readiness_row = connection.execute(
+            "SELECT marts_ready, analysis_ready, dashboard_ready "
+            "FROM ops.analytics_readiness WHERE active_ingestion_run_id = %s",
+            (ingestion_run_id,),
+        ).fetchone()
+        add(
+            "dashboard_readiness_view_matches",
+            bool(readiness_row)
+            and tuple(readiness_row) == (marts_ready, dashboard_ready, dashboard_ready),
+            "ops.analytics_readiness связывает активный импорт, витрины и анализ",
         )
 
         mart_counts = {
@@ -503,6 +571,12 @@ def validate_analytics(settings: Settings) -> dict[str, Any]:
             "customer_segments": int(
                 connection.execute("SELECT count(*) FROM mart.customer_segments").fetchone()[0]
             ),
+            "cluster_metrics": int(
+                connection.execute("SELECT count(*) FROM mart.cluster_metrics").fetchone()[0]
+            ),
+            "cluster_profiles": int(
+                connection.execute("SELECT count(*) FROM mart.cluster_profiles").fetchone()[0]
+            ),
             "hypothesis_results": int(
                 connection.execute("SELECT count(*) FROM mart.hypothesis_results").fetchone()[0]
             ),
@@ -516,7 +590,9 @@ def validate_analytics(settings: Settings) -> dict[str, Any]:
         checks.extend(
             _validate_marts(
                 connection,
+                marts_run_id,
                 fingerprint,
+                ingestion_run_id,
                 {
                     "order_activity": mart_counts["order_activity"],
                     "customer_features": mart_counts["customer_features"],
@@ -531,7 +607,10 @@ def validate_analytics(settings: Settings) -> dict[str, Any]:
         )
         add(
             "expected_hypothesis_results_present",
-            mart_counts["hypothesis_results"] >= 4 and mart_counts["hypothesis_pairs"] == 6,
+            mart_counts["hypothesis_results"] >= 4
+            and mart_counts["hypothesis_pairs"] == 6
+            and mart_counts["cluster_metrics"] > 0
+            and mart_counts["cluster_profiles"] > 0,
             "есть H1, H2 по уровням departments/aisles, H3 и парные сравнения",
         )
         size = int(
@@ -545,14 +624,15 @@ def validate_analytics(settings: Settings) -> dict[str, Any]:
         return {
             "status": "succeeded" if passed else "stale_or_invalid",
             "passed": passed,
-            "stale": state_fingerprint != fingerprint or marts_run is None or analysis_run is None,
+            "stale": not dashboard_ready,
+            "dashboard_ready": dashboard_ready,
             "active_dataset_fingerprint": fingerprint,
             "ingestion_run_id": str(ingestion_run_id),
             "marts_run_id": str(marts_run_id),
             "analysis_run_id": str(analysis_run_id) if analysis_run_id else None,
-            "marts_finished_at": marts_run[4].isoformat() if marts_run and marts_run[4] else None,
-            "analysis_finished_at": analysis_run[4].isoformat()
-            if analysis_run and analysis_run[4]
+            "marts_finished_at": marts_run[6].isoformat() if marts_run and marts_run[6] else None,
+            "analysis_finished_at": analysis_run[6].isoformat()
+            if analysis_run and analysis_run[6]
             else None,
             "row_counts": mart_counts,
             "mart_size_bytes": size,

@@ -27,7 +27,7 @@ marts:
 	uv run instacart marts --json-report "$(ANALYTICS_REPORT)" --markdown-report "$(ANALYTICS_MARKDOWN_REPORT)"
 
 analyze:
-	uv run instacart analyze --json-report "$(ANALYTICS_REPORT)" --markdown-report "$(ANALYTICS_MARKDOWN_REPORT)" --random-seed "$(ANALYTICS_RANDOM_SEED)" --bootstrap-replicates "$(BOOTSTRAP_REPLICATES)" --bootstrap-customer-sample "$(BOOTSTRAP_CUSTOMER_SAMPLE)" --silhouette-sample-size "$(SILHOUETTE_SAMPLE_SIZE)"
+	uv run instacart analyze --json-report "$(ANALYTICS_REPORT)" --markdown-report "$(ANALYTICS_MARKDOWN_REPORT)" --random-seed "$(ANALYTICS_RANDOM_SEED)" --bootstrap-replicates "$(BOOTSTRAP_REPLICATES)" --silhouette-sample-size "$(SILHOUETTE_SAMPLE_SIZE)"
 
 validate-analytics:
 	uv run instacart validate-analytics --report "$(ANALYTICS_VALIDATION_REPORT)"
@@ -49,5 +49,4 @@ ANALYTICS_MARKDOWN_REPORT ?= reports/analytics.md
 ANALYTICS_VALIDATION_REPORT ?= reports/analytics-validation.json
 ANALYTICS_RANDOM_SEED ?= 2026
 BOOTSTRAP_REPLICATES ?= 200
-BOOTSTRAP_CUSTOMER_SAMPLE ?= 10000
 SILHOUETTE_SAMPLE_SIZE ?= 5000

@@ -52,7 +52,6 @@ def _parser(settings: Settings) -> argparse.ArgumentParser:
     )
     analysis.add_argument("--random-seed", type=int, default=2026)
     analysis.add_argument("--bootstrap-replicates", type=int, default=200)
-    analysis.add_argument("--bootstrap-customer-sample", type=int, default=10_000)
     analysis.add_argument("--silhouette-sample-size", type=int, default=5_000)
     analytics_validation = commands.add_parser(
         "validate-analytics", help="проверить корректность и актуальность аналитики"
@@ -105,7 +104,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                         settings,
                         random_seed=args.random_seed,
                         bootstrap_replicates=args.bootstrap_replicates,
-                        bootstrap_customer_sample=args.bootstrap_customer_sample,
                         silhouette_sample_size=args.silhouette_sample_size,
                     )
                 payload = {"status": "succeeded", **result}
