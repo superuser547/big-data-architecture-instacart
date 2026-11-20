@@ -15,5 +15,24 @@ services:
       timeout: 3s
       retries: 20
 
+  dashboard:
+    build:
+      context: .
+    command:
+      - uv
+      - run
+      - streamlit
+      - run
+      - src/instacart/dashboard/app.py
+      - --server.address=0.0.0.0
+    environment:
+      DATABASE_URL: postgresql://instacart:instacart_local@postgres:5432/instacart
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["dashboard"]
+
 volumes:
   postgres_data:

@@ -1,4 +1,4 @@
-.PHONY: setup profile ingest validate marts analyze validate-analytics lint test check db-up db-down migrate
+.PHONY: setup profile ingest validate marts analyze validate-analytics dashboard lint test check db-up db-down migrate
 
 setup:
 	uv sync --locked --python 3.11 --all-groups
@@ -31,6 +31,9 @@ analyze:
 
 validate-analytics:
 	uv run instacart validate-analytics --report "$(ANALYTICS_VALIDATION_REPORT)"
+
+dashboard:
+	uv run streamlit run src/instacart/dashboard/app.py
 
 lint:
 	uv run ruff check .
