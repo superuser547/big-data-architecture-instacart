@@ -18,6 +18,8 @@ class Settings:
     duckdb_temp_directory: Path
     profile_report: Path
     validation_report: Path
+    analytics_report: Path = Path("reports/analytics.json")
+    analytics_markdown_report: Path = Path("reports/analytics.md")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -33,4 +35,8 @@ class Settings:
             duckdb_temp_directory=Path(os.getenv("DUCKDB_TEMP_DIRECTORY", "data/tmp/duckdb")),
             profile_report=Path(os.getenv("PROFILE_REPORT", "reports/profile.json")),
             validation_report=Path(os.getenv("VALIDATION_REPORT", "reports/validation.json")),
+            analytics_report=Path(os.getenv("ANALYTICS_REPORT", "reports/analytics.json")),
+            analytics_markdown_report=Path(
+                os.getenv("ANALYTICS_MARKDOWN_REPORT", "reports/analytics.md")
+            ),
         )

@@ -10,12 +10,18 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+from instacart.analytics.service import (
+    AnalyticsDataUnavailable,
+    analyze,
+    build_marts,
+    validate_analytics,
+)
 from instacart.config import Settings
 from instacart.dataset import open_dataset
 from instacart.db import connect
 from instacart.ingestion import ingest
 from instacart.profiling import profile_dataset
-from instacart.reports import write_json
+from instacart.reports import write_json, write_markdown
 from instacart.validation import validate_database
 
 
@@ -34,6 +40,26 @@ def _parser(settings: Settings) -> argparse.ArgumentParser:
             )
     validate = commands.add_parser("validate", help="проверить загруженные таблицы PostgreSQL")
     validate.add_argument("--report", type=Path, default=settings.validation_report)
+    marts = commands.add_parser("marts", help="обновить SQL-аналитические витрины")
+    marts.add_argument("--json-report", type=Path, default=settings.analytics_report)
+    marts.add_argument("--markdown-report", type=Path, default=settings.analytics_markdown_report)
+    analysis = commands.add_parser(
+        "analyze", help="проверить гипотезы и сегментировать покупателей"
+    )
+    analysis.add_argument("--json-report", type=Path, default=settings.analytics_report)
+    analysis.add_argument(
+        "--markdown-report", type=Path, default=settings.analytics_markdown_report
+    )
+    analysis.add_argument("--random-seed", type=int, default=2026)
+    analysis.add_argument("--bootstrap-replicates", type=int, default=200)
+    analysis.add_argument("--bootstrap-customer-sample", type=int, default=10_000)
+    analysis.add_argument("--silhouette-sample-size", type=int, default=5_000)
+    analytics_validation = commands.add_parser(
+        "validate-analytics", help="проверить корректность и актуальность аналитики"
+    )
+    analytics_validation.add_argument(
+        "--report", type=Path, default=Path("reports/analytics-validation.json")
+    )
     return parser
 
 
@@ -69,6 +95,63 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "Запуск %s завершён; отчёт: %s", report["run_id"], args.report
             )
             return 0
+        if args.command in ("marts", "analyze"):
+            command_started = time.monotonic()
+            try:
+                if args.command == "marts":
+                    result = build_marts(settings)
+                else:
+                    result = analyze(
+                        settings,
+                        random_seed=args.random_seed,
+                        bootstrap_replicates=args.bootstrap_replicates,
+                        bootstrap_customer_sample=args.bootstrap_customer_sample,
+                        silhouette_sample_size=args.silhouette_sample_size,
+                    )
+                payload = {"status": "succeeded", **result}
+                payload["generated_at"] = datetime.now(UTC).isoformat()
+                write_json(args.json_report, payload)
+                write_markdown(args.markdown_report, payload)
+                logging.getLogger(__name__).info(
+                    "Отчёт аналитики: %s; Markdown: %s; длительность %.1f с",
+                    args.json_report,
+                    args.markdown_report,
+                    time.monotonic() - command_started,
+                )
+                return 0
+            except AnalyticsDataUnavailable as exc:
+                payload = {
+                    "status": "stale_or_missing",
+                    "error": str(exc),
+                    "duration_seconds": round(time.monotonic() - command_started, 3),
+                    "generated_at": datetime.now(UTC).isoformat(),
+                }
+                write_json(args.json_report, payload)
+                write_markdown(args.markdown_report, payload)
+                logging.getLogger(__name__).error("%s", exc)
+                return 2
+            except Exception as exc:
+                payload = {
+                    "status": "failed",
+                    "error": str(exc),
+                    "duration_seconds": round(time.monotonic() - command_started, 3),
+                    "generated_at": datetime.now(UTC).isoformat(),
+                }
+                write_json(args.json_report, payload)
+                write_markdown(args.markdown_report, payload)
+                logging.getLogger(__name__).exception("Аналитическая команда завершилась ошибкой")
+                return 1
+        if args.command == "validate-analytics":
+            report = validate_analytics(settings)
+            report["validated_at"] = datetime.now(UTC).isoformat()
+            write_json(args.report, report)
+            logging.getLogger(__name__).info(
+                "Проверка аналитики: %s; витрин: %s; размер: %s байт",
+                report["status"],
+                report.get("row_counts", {}),
+                report.get("mart_size_bytes", 0),
+            )
+            return 0 if report["passed"] else 1
         with connect(settings) as connection:
             report = validate_database(connection)
         report["validated_at"] = datetime.now(UTC).isoformat()

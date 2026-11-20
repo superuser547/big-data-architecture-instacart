@@ -27,10 +27,13 @@ fingerprint набора записываются в JSON-отчёт и журн
 - `ingestion.py` передаёт большие CSV в PostgreSQL через потоковый `COPY`,
   нормализует справочники и регистрирует запуск.
 - `validation.py` проверяет количества, последовательности и целостность после загрузки.
-- Alembic управляет схемами `core`, `ops` и пустой схемой `mart`.
+- Alembic управляет схемами `core`, `ops` и версионными витринами `mart`.
+- `src/instacart/analytics/` строит PostgreSQL-витрины, проверяет три гипотезы
+  и сегментирует покупателей без загрузки всех товарных позиций в pandas.
 
 Сводная модель и детали ETL описаны в [архитектуре](docs/architecture.md),
 [словаре данных](docs/data-dictionary.md) и [запуске](docs/operations.md).
+Статистические допущения и ограничения приведены в [методологии](docs/methodology.md).
 
 ## Быстрый запуск
 
@@ -43,6 +46,9 @@ make setup
 make profile
 make ingest
 make validate
+make marts
+make analyze
+make validate-analytics
 make check
 ```
 
@@ -56,4 +62,9 @@ uv run instacart ingest --dataset data/raw --force
 
 Отчёты JSON по умолчанию создаются в `reports/`. Интеграционные тесты используют
 отдельную пустую PostgreSQL через `INTEGRATION_DATABASE_URL`; CI поднимает её
-сам и работает на синтетических CSV.
+сам и работает на синтетических CSV. Отчёты аналитики создаются в JSON и Markdown;
+пути и параметры выборки настраиваются переменными `ANALYTICS_REPORT`,
+`ANALYTICS_MARKDOWN_REPORT`, `ANALYTICS_RANDOM_SEED`, `BOOTSTRAP_REPLICATES`,
+`BOOTSTRAP_CUSTOMER_SAMPLE` и `SILHOUETTE_SAMPLE_SIZE`. `make analyze` требует
+актуальные витрины от `make marts`; `make validate-analytics` проверяет публикацию
+и fingerprint, поэтому скрытые устаревшие данные не считаются актуальными.
