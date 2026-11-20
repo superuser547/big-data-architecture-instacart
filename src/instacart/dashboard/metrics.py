@@ -40,7 +40,8 @@ def format_percentage_points(value: Any, digits: int = 1) -> str:
         return "нет данных"
     if not math.isfinite(number):
         return "нет данных"
-    return f"{number * 100:+.{digits}f} п.п.".replace(".", ",")
+    sign = "+" if number > 0 else ""
+    return f"{sign}{format_number(number * 100, digits)} п.п."
 
 
 def format_p_value(value: Any, log10_value: Any = None) -> str:

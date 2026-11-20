@@ -108,34 +108,35 @@ def load_overview(
             basket_min,
             basket_max,
         )
-        known_summary = connection.execute(
-            "SELECT count(*)::BIGINT AS known_order_count, "
-            "count(DISTINCT user_id)::BIGINT AS buyer_count, "
-            "coalesce(sum(basket_size), 0)::BIGINT AS item_count, "
-            "coalesce(sum(repeat_count), 0)::BIGINT AS repeated_item_count, "
-            "avg(basket_size)::DOUBLE PRECISION AS avg_basket_size "
+        aggregates = connection.execute(
+            "WITH filtered AS MATERIALIZED ("
+            "SELECT user_id, basket_size, repeat_count, days_since_prior_order "
             "FROM mart.order_summary WHERE run_id = %s AND dataset_fingerprint = %s "
             "AND eval_set = ANY(%s) AND order_dow = ANY(%s) "
-            "AND order_hour_of_day = ANY(%s) AND basket_size BETWEEN %s AND %s",
+            "AND order_hour_of_day = ANY(%s) AND basket_size BETWEEN %s AND %s), "
+            "summary AS (SELECT jsonb_build_object("
+            "'known_order_count', count(*)::BIGINT, "
+            "'buyer_count', count(DISTINCT user_id)::BIGINT, "
+            "'item_count', coalesce(sum(basket_size), 0)::BIGINT, "
+            "'repeated_item_count', coalesce(sum(repeat_count), 0)::BIGINT, "
+            "'avg_basket_size', avg(basket_size)::DOUBLE PRECISION) AS value "
+            "FROM filtered), "
+            "basket_counts AS (SELECT coalesce(jsonb_agg(to_jsonb(b) ORDER BY basket_from), "
+            "'[]'::jsonb) AS value FROM (SELECT "
+            "(floor((basket_size - 1) / 5.0)::INTEGER * 5 + 1) AS basket_from, "
+            "count(*)::BIGINT AS order_count FROM filtered GROUP BY basket_from) b), "
+            "intervals AS (SELECT coalesce(jsonb_agg(to_jsonb(i) ORDER BY interval_days), "
+            "'[]'::jsonb) AS value FROM (SELECT floor(days_since_prior_order)::INTEGER "
+            "AS interval_days, count(*)::BIGINT AS order_count FROM filtered "
+            "WHERE days_since_prior_order IS NOT NULL GROUP BY interval_days) i) "
+            "SELECT summary.value AS known_summary, basket_counts.value AS basket_counts, "
+            "intervals.value AS intervals FROM summary CROSS JOIN basket_counts "
+            "CROSS JOIN intervals",
             known_filter,
         ).fetchone()
-        basket_counts = connection.execute(
-            "SELECT (floor((basket_size - 1) / 5.0)::INTEGER * 5 + 1) AS basket_from, "
-            "count(*)::BIGINT AS order_count FROM mart.order_summary "
-            "WHERE run_id = %s AND dataset_fingerprint = %s AND eval_set = ANY(%s) "
-            "AND order_dow = ANY(%s) AND order_hour_of_day = ANY(%s) "
-            "AND basket_size BETWEEN %s AND %s GROUP BY basket_from ORDER BY basket_from",
-            known_filter,
-        ).fetchall()
-        intervals = connection.execute(
-            "SELECT floor(days_since_prior_order)::INTEGER AS interval_days, "
-            "count(*)::BIGINT AS order_count FROM mart.order_summary "
-            "WHERE run_id = %s AND dataset_fingerprint = %s AND eval_set = ANY(%s) "
-            "AND order_dow = ANY(%s) AND order_hour_of_day = ANY(%s) "
-            "AND basket_size BETWEEN %s AND %s AND days_since_prior_order IS NOT NULL "
-            "GROUP BY interval_days ORDER BY interval_days",
-            known_filter,
-        ).fetchall()
+        known_summary = aggregates["known_summary"]
+        basket_counts = aggregates["basket_counts"]
+        intervals = aggregates["intervals"]
     return {
         "overview": overview,
         "activity": activity,
@@ -366,25 +367,36 @@ def load_segments(
             "AND run_type = 'analysis' AND status = 'succeeded'",
             (lineage[3], lineage[0], lineage[1], lineage[2]),
         ).fetchone()
+        population_size = sum(int(row["customer_count"]) for row in profiles)
+        sample_stride = max(1, (population_size + sample_limit - 1) // sample_limit)
         points = connection.execute(
-            "WITH cluster_count AS (SELECT count(DISTINCT cluster_id) AS count "
-            "FROM mart.customer_segments WHERE run_id = %s AND dataset_fingerprint = %s), "
-            "ranked AS (SELECT cluster_id, pca_1, pca_2, user_id, "
-            "row_number() OVER (PARTITION BY cluster_id ORDER BY "
-            "hashtextextended(user_id::TEXT, 2026), user_id) AS sample_rank, "
-            "greatest(1, %s / cluster_count.count) AS per_cluster "
-            "FROM mart.customer_segments CROSS JOIN cluster_count "
-            "WHERE run_id = %s AND dataset_fingerprint = %s) "
-            "SELECT cluster_id, pca_1, pca_2 FROM ranked "
-            "WHERE sample_rank <= per_cluster ORDER BY cluster_id, sample_rank",
-            (lineage[3], lineage[0], sample_limit, lineage[3], lineage[0]),
+            "SELECT cluster_id, pca_1, pca_2 FROM mart.customer_segments "
+            "WHERE run_id = %s AND dataset_fingerprint = %s "
+            "AND mod(user_id, %s) = 0 ORDER BY user_id",
+            (lineage[3], lineage[0], sample_stride),
         ).fetchall()
+        sampled_clusters = {int(row["cluster_id"]) for row in points}
+        missing_clusters = [
+            int(row["cluster_id"])
+            for row in profiles
+            if int(row["cluster_id"]) not in sampled_clusters
+        ]
+        if missing_clusters:
+            points.extend(
+                connection.execute(
+                    "SELECT DISTINCT ON (cluster_id) cluster_id, pca_1, pca_2 "
+                    "FROM mart.customer_segments WHERE run_id = %s "
+                    "AND dataset_fingerprint = %s AND cluster_id = ANY(%s) "
+                    "ORDER BY cluster_id, user_id",
+                    (lineage[3], lineage[0], missing_clusters),
+                ).fetchall()
+            )
     selected = next((row["k"] for row in metrics if row["selected"]), None)
     return {
         "profiles": profiles,
         "metrics": metrics,
         "points": points,
-        "population_size": sum(int(row["customer_count"]) for row in profiles),
+        "population_size": population_size,
         "selected_k": selected,
         "selection_basis": analysis["selection_basis"] if analysis else None,
         "pca_explained_variance_ratio": analysis["pca_explained_variance_ratio"]

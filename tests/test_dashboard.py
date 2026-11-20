@@ -42,14 +42,18 @@ class _Connection:
             return _Result(one={"order_count": 2})
         if "mart.order_activity" in sql:
             return _Result(many=[{"order_dow": 0, "order_hour_of_day": 9, "order_count": 2}])
-        if "count(*)::BIGINT AS known_order_count" in sql:
+        if "'known_order_count'" in sql:
             return _Result(
                 one={
-                    "known_order_count": 1,
-                    "buyer_count": 1,
-                    "item_count": 2,
-                    "repeated_item_count": 1,
-                    "avg_basket_size": 2.0,
+                    "known_summary": {
+                        "known_order_count": 1,
+                        "buyer_count": 1,
+                        "item_count": 2,
+                        "repeated_item_count": 1,
+                        "avg_basket_size": 2.0,
+                    },
+                    "basket_counts": [{"basket_from": 1, "order_count": 1}],
+                    "intervals": [{"interval_days": 7, "order_count": 1}],
                 }
             )
         return _Result(many=[])
@@ -211,6 +215,57 @@ def test_category_filters_are_sent_as_query_parameters(monkeypatch) -> None:
     assert "category_id = ANY(%s)" in category_sql
     assert category_params[2:8] == ("aisle", ["prior", "train"], [0, 1], [10, 11], 5, 40)
     assert category_params[-2:] == ([12], [12])
+
+
+def test_segment_sample_is_deterministic_and_adds_missing_clusters(monkeypatch) -> None:
+    connection = _Connection()
+
+    def execute(sql: str, params: tuple[Any, ...] | None = None) -> _Result:
+        connection.calls.append((sql, params))
+        if "mart.cluster_profiles" in sql:
+            return _Result(
+                many=[
+                    {"cluster_id": 0, "customer_count": 6},
+                    {"cluster_id": 1, "customer_count": 4},
+                ]
+            )
+        if "mart.cluster_metrics" in sql:
+            return _Result(many=[])
+        if "ops.analytics_runs" in sql:
+            return _Result(one={"selection_basis": "sample", "pca_explained_variance_ratio": []})
+        if "mod(user_id, %s) = 0" in sql:
+            return _Result(many=[{"cluster_id": 0, "pca_1": 0.2, "pca_2": 0.3}])
+        if "DISTINCT ON (cluster_id)" in sql:
+            return _Result(many=[{"cluster_id": 1, "pca_1": 0.8, "pca_2": 0.9}])
+        return _Result(many=[])
+
+    connection.execute = execute  # type: ignore[method-assign]
+
+    @contextmanager
+    def readonly(_url: str) -> Iterator[_Connection]:
+        yield connection
+
+    monkeypatch.setattr(data, "readonly_connection", readonly)
+    data.load_segments.clear()
+    result = data.load_segments(
+        "postgresql://example",
+        "sha256:abc",
+        "ingestion-1",
+        "marts-1",
+        "analysis-1",
+        sample_limit=5,
+    )
+
+    assert result["population_size"] == 10
+    assert {row["cluster_id"] for row in result["points"]} == {0, 1}
+    sample_sql, sample_params = next(call for call in connection.calls if "mod(user_id" in call[0])
+    assert "run_id = %s AND dataset_fingerprint = %s" in sample_sql
+    assert sample_params == ("analysis-1", "sha256:abc", 2)
+    fallback_sql, fallback_params = next(
+        call for call in connection.calls if "DISTINCT ON" in call[0]
+    )
+    assert "cluster_id = ANY(%s)" in fallback_sql
+    assert fallback_params == ("analysis-1", "sha256:abc", [1])
 
 
 def test_display_formatting_handles_missing_values_and_small_probabilities() -> None:
