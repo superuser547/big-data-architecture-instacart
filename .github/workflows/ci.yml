@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: instacart_test
+          POSTGRES_USER: instacart
+          POSTGRES_PASSWORD: instacart_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U instacart -d instacart_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      INTEGRATION_DATABASE_URL: postgresql://instacart:instacart_ci@localhost:5432/instacart_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest
